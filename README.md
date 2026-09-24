@@ -22,7 +22,7 @@ A lightweight, terminal-based chat application built with Bash that enables real
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/codev-aryan/termichat.git
+git clone https://github.com/mehta-aryan/termichat.git
 cd termichat
 ```
 
@@ -173,7 +173,7 @@ This project is open source and available under the MIT License.
 
 ## Author
 
-Created by [codev-aryan](https://github.com/codev-aryan)
+Created by [mehta-aryan](https://github.com/mehta-aryan)
 
 ## Acknowledgments
 
