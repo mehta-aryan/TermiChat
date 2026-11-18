@@ -15,6 +15,9 @@ tests/test_framing
 *.log
 /tmp/
 
+# Windows / WSL Alternate Data Stream metadata
+*:Zone.Identifier
+
 # Editor / OS metadata
 .vscode/
 .idea/

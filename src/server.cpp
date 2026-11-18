@@ -11,9 +11,10 @@
 #include <chrono>
 #include <cstring>        // strerror
 #include <ctime>          // localtime_r, strftime
-#include <cstdio>         // snprintf
 #include <cerrno>
+#include <exception>
 #include <iostream>
+#include <system_error>
 #include <vector>
 #include <mutex>
 
@@ -50,14 +51,16 @@ FrameStatus ClientSession::send_frame(MsgType type, const std::string& payload) 
 // ── Server helpers ────────────────────────────────────────────────────────────
 Server::Server(uint16_t port) : port_(port) {}
 
-void Server::add_client(std::shared_ptr<ClientSession> session) {
+std::size_t Server::add_client(std::shared_ptr<ClientSession> session) {
     std::lock_guard<std::mutex> lk(registry_mutex_);
     clients_[session->id()] = std::move(session);
+    return clients_.size();
 }
 
-void Server::remove_client(int id) {
+std::size_t Server::remove_client(int id) {
     std::lock_guard<std::mutex> lk(registry_mutex_);
     clients_.erase(id);
+    return clients_.size();
 }
 
 void Server::broadcast(int sender_id, MsgType type, const std::string& payload) {
@@ -75,8 +78,9 @@ void Server::broadcast(int sender_id, MsgType type, const std::string& payload) 
     for (auto& sess : targets) {
         FrameStatus st = sess->send_frame(type, payload);
         if (st != FrameStatus::OK) {
+            const int err = errno;   // capture before anything else can change it
             log("[WARN] Send to Client " + std::to_string(sess->id())
-                + " (" + sess->peer_addr() + ") failed: " + std::strerror(errno)
+                + " (" + sess->peer_addr() + ") failed: " + std::strerror(err)
                 + " – shutting down its socket");
             // shutdown() unblocks the client's own recv() loop so that thread
             // will clean up.  We do NOT close the fd here because we don't own
@@ -87,78 +91,71 @@ void Server::broadcast(int sender_id, MsgType type, const std::string& payload) 
 }
 
 // ── Per-client thread ─────────────────────────────────────────────────────────
-void Server::client_thread(std::shared_ptr<ClientSession> session) {
-    // Wrap thread entry point in try/catch so no exception can reach std::terminate.
-    try {
-        const int    cid  = session->id();
-        const std::string peer = session->peer_addr();
+Server::Disconnect Server::serve_client(ClientSession& session) {
+    while (true) {
+        MsgType     type;
+        std::string payload;
+        FrameStatus st = recv_frame(session.fd(), type, payload);
+        const int   err = errno;   // only meaningful for IO_ERROR
 
-        // Count online clients for the log message.
-        auto online_count = [this]() {
-            std::lock_guard<std::mutex> lk(registry_mutex_);
-            return clients_.size();
-        };
-
-        while (true) {
-            MsgType     type;
-            std::string payload;
-            FrameStatus st = recv_frame(session->fd(), type, payload);
-
-            if (st == FrameStatus::PEER_CLOSED) {
-                remove_client(cid);
-                log("[INFO] Client " + std::to_string(cid) + " disconnected"
-                    " (peer closed connection) ("
-                    + std::to_string(online_count()) + " online)");
-                return;
-            }
-            if (st == FrameStatus::PEER_CLOSED_MIDFRAME) {
-                remove_client(cid);
-                log("[WARN] Client " + std::to_string(cid)
-                    + " disconnected mid-frame (incomplete frame) ("
-                    + std::to_string(online_count()) + " online)");
-                return;
-            }
-            if (st == FrameStatus::IO_ERROR) {
-                remove_client(cid);
-                log("[WARN] Client " + std::to_string(cid)
-                    + " I/O error: " + std::strerror(errno) + " ("
-                    + std::to_string(online_count()) + " online)");
-                return;
-            }
-            if (st == FrameStatus::PROTOCOL_VIOLATION) {
-                remove_client(cid);
-                log("[WARN] Client " + std::to_string(cid)
-                    + " protocol violation – dropping ("
-                    + std::to_string(online_count()) + " online)");
-                ::shutdown(session->fd(), SHUT_RDWR);
-                return;
-            }
-
-            // st == OK; type == CHAT (recv_frame already validated it).
-            if (payload.empty()) continue; // skip empty messages
-
-            // Build "[HH:MM] [Client N]: <text>" using localtime_r (thread-safe;
-            // the POSIX version of localtime uses thread-local storage).
-            char tbuf[8];
-            std::time_t t = std::time(nullptr);
-            std::tm tm_buf{};
-            localtime_r(&t, &tm_buf);
-            std::strftime(tbuf, sizeof(tbuf), "%H:%M", &tm_buf);
-
-            std::string msg = std::string("[") + tbuf + "] [Client "
-                            + std::to_string(cid) + "]: " + payload;
-
-            broadcast(cid, MsgType::CHAT, msg);
+        switch (st) {
+        case FrameStatus::OK:
+            break;
+        case FrameStatus::PEER_CLOSED:
+            return {true, "peer closed connection"};
+        case FrameStatus::PEER_CLOSED_MIDFRAME:
+            return {false, "peer closed connection mid-frame (truncated frame)"};
+        case FrameStatus::IO_ERROR:
+            return {false, std::string("recv error: ") + std::strerror(err)};
+        case FrameStatus::PROTOCOL_VIOLATION:
+            return {false, "protocol violation (bad length or unknown type)"};
         }
-    } catch (const std::exception& e) {
-        remove_client(session->id());
-        log("[ERROR] Client " + std::to_string(session->id())
-            + " thread exception: " + e.what());
-    } catch (...) {
-        remove_client(session->id());
-        log("[ERROR] Client " + std::to_string(session->id())
-            + " thread unknown exception");
+
+        // st == OK; type == CHAT (recv_frame already validated it).
+        if (payload.empty()) continue; // skip empty messages
+
+        // recv_frame accepts up to MAX_PAYLOAD so the framing layer stays
+        // generic, but a chat line is limited to MAX_CHAT_TEXT.  Without this
+        // check a raw client could make us relay a frame that every normal
+        // client rejects as a protocol error and disconnects from.
+        if (payload.size() > MAX_CHAT_TEXT)
+            return {false, "protocol violation (chat text longer than "
+                           + std::to_string(MAX_CHAT_TEXT) + " bytes)"};
+
+        // Build "[HH:MM] [Client N]: <text>" using localtime_r (thread-safe;
+        // the POSIX version of localtime uses thread-local storage).
+        char tbuf[8];
+        std::time_t t = std::time(nullptr);
+        std::tm tm_buf{};
+        localtime_r(&t, &tm_buf);
+        std::strftime(tbuf, sizeof(tbuf), "%H:%M", &tm_buf);
+
+        std::string msg = std::string("[") + tbuf + "] [Client "
+                        + std::to_string(session.id()) + "]: " + payload;
+
+        broadcast(session.id(), MsgType::CHAT, msg);
     }
+}
+
+void Server::client_thread(std::shared_ptr<ClientSession> session) {
+    Disconnect why{false, "internal error"};
+    try {
+        why = serve_client(*session);
+    } catch (const std::exception& e) {
+        why = {false, std::string("internal error: ") + e.what()};
+    } catch (...) {
+        why = {false, "internal error (unknown exception)"};
+    }
+
+    // Send our FIN now (a violating peer should not wait for the last
+    // shared_ptr to drop), then leave the registry.  The fd itself is closed by
+    // ~Socket when the last reference disappears.
+    ::shutdown(session->fd(), SHUT_RDWR);
+    const std::size_t online = remove_client(session->id());
+
+    log(std::string(why.clean ? "[INFO] " : "[WARN] ") + "Client "
+        + std::to_string(session->id()) + " disconnected (" + why.reason
+        + ") (" + std::to_string(online) + " online)");
 }
 
 // ── accept() loop ─────────────────────────────────────────────────────────────
@@ -220,25 +217,28 @@ void Server::run() {
         std::string peer_str = std::string(ip_buf) + ":"
                              + std::to_string(ntohs(peer_addr.sin_port));
 
-        // Assign a sequential id atomically so that simultaneous accepts on
-        // multiple threads (Phase 4) would still produce unique ids.
+        // Ids are assigned here, in the accept thread, in accept order.
         int cid = next_id_.fetch_add(1);
         auto session = std::make_shared<ClientSession>(
             cid, Socket(cli_fd), peer_str);
 
-        add_client(session);
-
-        {
-            std::lock_guard<std::mutex> lk(registry_mutex_);
-            log("[INFO] Client " + std::to_string(cid)
-                + " connected from " + peer_str
-                + " (" + std::to_string(clients_.size()) + " online)");
-        }
+        const std::size_t online = add_client(session);
+        log("[INFO] Client " + std::to_string(cid)
+            + " connected from " + peer_str
+            + " (" + std::to_string(online) + " online)");
 
         // Spawn a detached thread for this client's recv loop.
         // Phase 4 will replace detached threads with tracked, joined threads
-        // for graceful shutdown.
-        std::thread t(&Server::client_thread, this, session);
-        t.detach();
+        // for graceful shutdown.  std::thread's constructor throws if the OS
+        // refuses a new thread (resource limits); drop just this client and
+        // keep serving the others rather than letting the exception kill us.
+        try {
+            std::thread(&Server::client_thread, this, session).detach();
+        } catch (const std::system_error& e) {
+            const std::size_t left = remove_client(cid);
+            log("[WARN] Could not start a thread for Client "
+                + std::to_string(cid) + ": " + e.what() + " – dropping it ("
+                + std::to_string(left) + " online)");
+        }
     }
 }

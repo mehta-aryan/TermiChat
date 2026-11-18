@@ -28,80 +28,102 @@ Client::Client(const std::string& host, uint16_t port)
     std::string port_str = std::to_string(port);
     int gai_err = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
     if (gai_err != 0) {
-        throw NetError("getaddrinfo(" + host + "): "
-                       + std::string(gai_strerror(gai_err)));
+        // getaddrinfo does not use errno; it has its own error codes.
+        throw NetError("getaddrinfo(" + host + ")", gai_strerror(gai_err));
     }
 
     // Try each result in order until one connects successfully.
-    int conn_fd = -1;
     int saved_errno = 0;
-    for (addrinfo* rp = res; rp != nullptr; rp = rp->ai_next) {
-        int fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
+    bool connected = false;
+    for (addrinfo* rp = res; rp != nullptr && !connected; rp = rp->ai_next) {
+        // Socket owns the fd: a candidate that fails to connect is closed
+        // automatically when 'candidate' goes out of scope.
+        Socket candidate(::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol));
+        if (candidate.fd() < 0) { saved_errno = errno; continue; }
 
         // connect() initiates the TCP three-way handshake.  It blocks until
         // the kernel receives the SYN-ACK from the server and sends the final
         // ACK, or until it times out or is refused.
-        if (::connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            conn_fd = fd;
-            break;
+        if (::connect(candidate.fd(), rp->ai_addr, rp->ai_addrlen) == 0) {
+            sock_ = std::move(candidate);
+            connected = true;
+        } else {
+            saved_errno = errno;
         }
-        saved_errno = errno;
-        ::close(fd);
     }
     ::freeaddrinfo(res);  // must always free, even on error
 
-    if (conn_fd < 0) {
+    if (!connected) {
         errno = saved_errno;
         throw NetError("connect() to " + host + ":" + port_str);
     }
 
-    sock_ = Socket(conn_fd);
     std::cout << "Connected to " << host << ":" << port << '\n';
     std::cout.flush();
 }
 
 // ── Receiver thread ───────────────────────────────────────────────────────────
 void Client::receiver_loop() {
-    try {
-        while (running_.load()) {
-            MsgType     type;
-            std::string payload;
-            FrameStatus st = recv_frame(sock_.fd(), type, payload);
+    while (running_.load()) {
+        MsgType     type;
+        std::string payload;
+        FrameStatus st = recv_frame(sock_.fd(), type, payload);
+        const int   err = errno;   // only meaningful for IO_ERROR
 
-            if (st == FrameStatus::OK) {
-                // Payload is binary-safe: printed with write() semantics via cout.
-                std::cout << payload << '\n';
-                std::cout.flush();
-                continue;
-            }
-
-            // If the user ended input cleanly (Ctrl+D), do not treat peer closure as an error.
-            if (user_eof_.load()) {
-                return;
-            }
-
-            // Any non-OK status means the server connection is gone unexpectedly.
-            running_.store(false);
-            exit_code_ = 1;
-
-            if (st == FrameStatus::PEER_CLOSED) {
-                std::cout << "*** Server closed the connection\n";
-            } else if (st == FrameStatus::PEER_CLOSED_MIDFRAME) {
-                std::cout << "*** Server closed the connection (mid-frame)\n";
-            } else if (st == FrameStatus::IO_ERROR) {
-                std::cout << "*** Connection error: " << std::strerror(errno) << '\n';
-            } else {
-                std::cout << "*** Protocol error from server\n";
-            }
+        if (st == FrameStatus::OK) {
+            // Payload is binary-safe: printed with write() semantics via cout.
+            std::cout << payload << '\n';
             std::cout.flush();
+            continue;
         }
-    } catch (...) {
-        if (!user_eof_.load()) {
-            running_.store(false);
-            exit_code_ = 1;
+
+        // Any non-OK status ends the session.  exchange() tells us who got
+        // there first: if running_ was already false, the main thread is
+        // quitting on purpose (Ctrl+D) and its shutdown() is what woke us up,
+        // so there is nothing to report and the exit code stays 0.
+        if (!running_.exchange(false)) return;
+        exit_code_.store(1);
+
+        if (st == FrameStatus::PEER_CLOSED) {
+            std::cout << "*** Server closed the connection\n";
+        } else if (st == FrameStatus::PEER_CLOSED_MIDFRAME) {
+            std::cout << "*** Server closed the connection (mid-frame)\n";
+        } else if (st == FrameStatus::IO_ERROR) {
+            std::cout << "*** Connection error: " << std::strerror(err) << '\n';
+        } else {
+            std::cout << "*** Protocol error from server\n";
         }
+        std::cout.flush();
     }
+}
+
+// ── Helpers used by the main thread ───────────────────────────────────────────
+void Client::fail(const std::string& message) {
+    // Same "who got there first" rule as the receiver: report only once.
+    if (running_.exchange(false)) {
+        exit_code_.store(1);
+        std::cout << "*** " << message << '\n';
+        std::cout.flush();
+    }
+}
+
+bool Client::send_line(std::string line) {
+    // Strip a trailing '\r' so the client works correctly when stdin comes
+    // from a Windows-style CRLF source (e.g., a pipe).
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) return true;           // never send empty messages
+
+    if (line.size() > MAX_CHAT_TEXT) {
+        std::cout << "Message too long (max 1024 bytes), not sent\n";
+        std::cout.flush();
+        return true;                         // connection is still fine
+    }
+
+    if (send_frame(sock_.fd(), MsgType::CHAT, line) != FrameStatus::OK) {
+        fail(std::string("Send failed: ") + std::strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 // ── Main loop: stdin → send ───────────────────────────────────────────────────
@@ -119,9 +141,7 @@ int Client::run() {
     char read_buf[256];
     bool stdin_eof = false;
 
-    while (!stdin_eof) {
-        if (!running_.load()) break;
-
+    while (!stdin_eof && running_.load()) {
         pollfd pfd{};
         pfd.fd     = STDIN_FILENO;
         pfd.events = POLLIN;
@@ -129,77 +149,55 @@ int Client::run() {
         int ret = ::poll(&pfd, 1, 200);  // 200 ms timeout
         if (ret < 0) {
             if (errno == EINTR) continue;
+            fail(std::string("poll() on stdin failed: ") + std::strerror(errno));
             break;
         }
         if (ret == 0) continue; // timeout – loop back to check running_
 
-        if (pfd.revents & POLLERR) break;
-        // On a pipe or FIFO, when the peer closes the write end and no data
-        // remains, poll() reports POLLHUP (without POLLIN).  We must check
-        // both so that EOF triggers a read() that returns 0.
-        if (!(pfd.revents & (POLLIN | POLLHUP))) continue;
+        // When the writer of a pipe/FIFO closes it, poll() reports POLLHUP
+        // (not POLLIN) once the data is drained.  A real terminal's Ctrl+D
+        // reports POLLIN.  Fall through to read() for all of them: it returns
+        // 0 on EOF, which is how we detect that input has ended.
+        if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) continue;
 
         // read() may give us multiple lines or a partial line in one call.
         ssize_t n = ::read(STDIN_FILENO, read_buf, sizeof(read_buf));
         if (n < 0) {
             if (errno == EINTR) continue;
+            fail(std::string("read() on stdin failed: ") + std::strerror(errno));
             break;
         }
-        if (n == 0) {
-            // EOF (Ctrl+D): send whatever is in the buffer if non-empty.
+        if (n == 0) {          // EOF (Ctrl+D, or the pipe writer closed)
             stdin_eof = true;
+            break;
         }
 
-        for (ssize_t i = 0; i < n; ++i) {
-            char c = read_buf[i];
-            if (c == '\n') {
-                // Strip a trailing '\r' so the client works correctly when
-                // stdin comes from a Windows-style CRLF source (e.g., a pipe).
-                if (!line_buf.empty() && line_buf.back() == '\r')
-                    line_buf.pop_back();
-
-                if (!line_buf.empty()) {
-                    if (line_buf.size() > MAX_CHAT_TEXT) {
-                        std::cout << "Message too long (max 1024 bytes), not sent\n";
-                        std::cout.flush();
-                    } else if (running_.load()) {
-                        send_frame(sock_.fd(), MsgType::CHAT, line_buf);
-                    }
-                }
+        bool ok = true;
+        for (ssize_t i = 0; i < n && ok; ++i) {
+            if (read_buf[i] == '\n') {
+                ok = send_line(std::move(line_buf));
                 line_buf.clear();
             } else {
-                line_buf += c;
+                line_buf += read_buf[i];
             }
         }
+        if (!ok) break;
     }
 
     // Send the last unterminated line at EOF if it is non-empty.
-    if (!line_buf.empty() && running_.load()) {
-        if (line_buf.back() == '\r') line_buf.pop_back();
-        if (!line_buf.empty()) {
-            if (line_buf.size() > MAX_CHAT_TEXT) {
-                std::cout << "Message too long (max 1024 bytes), not sent\n";
-                std::cout.flush();
-            } else {
-                send_frame(sock_.fd(), MsgType::CHAT, line_buf);
-            }
-        }
-    }
+    if (stdin_eof && running_.load() && !line_buf.empty())
+        send_line(std::move(line_buf));
 
-    // If the loop ended due to stdin EOF (Ctrl+D), record that this was a clean
-    // user-initiated exit so the receiver thread does not treat connection shutdown
-    // as a failure.
-    if (stdin_eof) {
-        user_eof_.store(true);
-        running_.store(false);
-        exit_code_ = 0;
-    }
+    // Claim the "who ended the session" decision.  If exchange() returns true
+    // the user quit; if false the receiver (or fail()) already reported a
+    // problem and set the exit code.
+    running_.exchange(false);
 
     // shutdown() sends a TCP FIN to the server and unblocks the receiver
-    // thread's recv_frame call, which will then see PEER_CLOSED and exit.
+    // thread's recv() call, which then sees running_ == false and exits quietly.
     ::shutdown(sock_.fd(), SHUT_RDWR);
 
     if (recv_thread_.joinable()) recv_thread_.join();
 
-    return exit_code_;
+    return exit_code_.load();
 }

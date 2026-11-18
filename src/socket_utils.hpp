@@ -20,6 +20,12 @@ public:
     // Format: "<what>: <strerror(errno)>"
     explicit NetError(const std::string& what_arg)
         : std::runtime_error(what_arg + ": " + std::strerror(errno)) {}
+
+    // For failures that do not set errno (e.g. getaddrinfo reports its own
+    // error code, text from gai_strerror).  Using the errno constructor there
+    // would append a stale, misleading "Success" or unrelated message.
+    NetError(const std::string& what_arg, const std::string& reason)
+        : std::runtime_error(what_arg + ": " + reason) {}
 };
 
 // ── Socket ───────────────────────────────────────────────────────────────────
@@ -47,9 +53,6 @@ public:
     ~Socket() { close_fd(); }
 
     int fd() const noexcept { return fd_; }
-
-    // Release ownership without closing – used when transferring to another owner.
-    int release() noexcept { int f = fd_; fd_ = -1; return f; }
 
 private:
     int fd_;
@@ -81,6 +84,11 @@ IOStatus send_all(int fd, const void* buf, std::size_t len);
 //
 // Returns:
 //   OK          – all bytes read
-//   PEER_CLOSED – recv() returned 0 before we got all bytes (clean TCP FIN)
+//   PEER_CLOSED – recv() returned 0 before we got all bytes (TCP FIN)
 //   ERROR       – a real socket error; errno is preserved
-IOStatus recv_all(int fd, void* buf, std::size_t len);
+//
+// 'bytes_read' (optional) receives how many bytes arrived before the call
+// ended.  A FIN after 0 bytes is a clean close between messages; a FIN after
+// 1..len-1 bytes means the peer vanished in the middle of one (truncation).
+IOStatus recv_all(int fd, void* buf, std::size_t len,
+                  std::size_t* bytes_read = nullptr);

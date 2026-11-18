@@ -9,8 +9,8 @@
 //   to enable graceful shutdown.
 //
 // Concurrency invariant: the global registry mutex is held only for map
-// operations (add/remove/snapshot).  It is NEVER held during socket I/O so
-// that one slow or dead client cannot block others.
+// operations (add/remove/snapshot).  It is NEVER held during socket I/O or
+// logging, so one slow or dead client cannot block others.
 
 #include "socket_utils.hpp"
 #include "protocol.hpp"
@@ -23,7 +23,9 @@
 
 // ── ClientSession ─────────────────────────────────────────────────────────────
 // Represents one connected client.  Owned by a shared_ptr so that the registry
-// and the per-client thread can both hold references safely.
+// and the per-client thread can both hold references safely.  The socket is
+// closed only when the last reference disappears, so a broadcaster that still
+// holds a snapshot can never write to a recycled file descriptor.
 class ClientSession {
 public:
     ClientSession(int id, Socket sock, std::string peer_addr);
@@ -52,6 +54,12 @@ public:
     void run();
 
 private:
+    // Why a client's connection ended (for the log line).
+    struct Disconnect {
+        bool        clean;   // true: peer closed normally between frames
+        std::string reason;
+    };
+
     uint16_t port_;
     std::atomic<int> next_id_{1};  // monotonically increasing client id
 
@@ -59,13 +67,20 @@ private:
     std::map<int, std::shared_ptr<ClientSession>> clients_;
     std::mutex registry_mutex_;
 
-    void add_client(std::shared_ptr<ClientSession> session);
-    void remove_client(int id);
+    // Both return the number of clients online after the change, read under
+    // the same lock so the log line is consistent.
+    std::size_t add_client(std::shared_ptr<ClientSession> session);
+    std::size_t remove_client(int id);
 
     // Sends a frame to every client except 'sender_id'.
     // Copies the session pointers under the lock, releases it, then sends.
     void broadcast(int sender_id, MsgType type, const std::string& payload);
 
-    // Entry point for the per-client detached thread.
+    // Entry point for the per-client detached thread.  Catches every
+    // exception (an exception escaping a thread would call std::terminate and
+    // kill the whole server) and performs the one-and-only cleanup.
     void client_thread(std::shared_ptr<ClientSession> session);
+
+    // The receive loop.  Returns when the connection ends, saying why.
+    Disconnect serve_client(ClientSession& session);
 };

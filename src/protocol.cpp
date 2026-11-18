@@ -6,6 +6,10 @@
 #include <cstring>       // memcpy
 
 FrameStatus send_frame(int fd, MsgType type, const std::string& payload) {
+    // Never emit a frame that every receiver would reject as a protocol
+    // violation (recv_frame enforces the same limit).
+    if (payload.size() > MAX_PAYLOAD) return FrameStatus::PROTOCOL_VIOLATION;
+
     // Build the whole frame in one buffer so that a single send_all() call
     // writes it atomically from the kernel's perspective.  Two separate
     // send_all() calls could be interleaved with another thread's frame on
@@ -21,18 +25,21 @@ FrameStatus send_frame(int fd, MsgType type, const std::string& payload) {
     if (!payload.empty())
         std::memcpy(frame.data() + 5, payload.data(), payload.size());
 
-    IOStatus st = send_all(fd, frame.data(), frame.size());
-    if (st == IOStatus::ERROR)  return FrameStatus::IO_ERROR;
-    if (st == IOStatus::PEER_CLOSED) return FrameStatus::IO_ERROR; // unexpected on send
-    return FrameStatus::OK;
+    return send_all(fd, frame.data(), frame.size()) == IOStatus::OK
+               ? FrameStatus::OK
+               : FrameStatus::IO_ERROR;
 }
 
 FrameStatus recv_frame(int fd, MsgType& out_type, std::string& out_payload) {
     // Step 1: read exactly 4 bytes for the length field.
-    // A clean peer close here (recv returns 0) is normal – the client quit.
+    // A FIN before any byte arrives is a normal close between frames.  A FIN
+    // after 1-3 header bytes means the peer vanished mid-frame.
     uint32_t net_len = 0;
-    IOStatus st = recv_all(fd, &net_len, 4);
-    if (st == IOStatus::PEER_CLOSED) return FrameStatus::PEER_CLOSED;
+    std::size_t header_got = 0;
+    IOStatus st = recv_all(fd, &net_len, 4, &header_got);
+    if (st == IOStatus::PEER_CLOSED)
+        return header_got == 0 ? FrameStatus::PEER_CLOSED
+                               : FrameStatus::PEER_CLOSED_MIDFRAME;
     if (st == IOStatus::ERROR)       return FrameStatus::IO_ERROR;
 
     // Step 2: convert from big-endian and validate BEFORE allocating.
