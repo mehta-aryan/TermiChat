@@ -1,0 +1,24 @@
+# Build directories and object/dependency files
+build/
+*.o
+*.d
+
+# Compiled binaries
+termichat_server
+termichat_client
+test_framing
+tests/test_framing
+
+# Packet captures & temporary test artifacts
+*.pcap
+*.pcapng
+*.log
+/tmp/
+
+# Editor / OS metadata
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
