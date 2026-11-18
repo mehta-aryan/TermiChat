@@ -88,65 +88,76 @@ void Server::broadcast(int sender_id, MsgType type, const std::string& payload) 
 
 // ── Per-client thread ─────────────────────────────────────────────────────────
 void Server::client_thread(std::shared_ptr<ClientSession> session) {
-    const int    cid  = session->id();
-    const std::string peer = session->peer_addr();
+    // Wrap thread entry point in try/catch so no exception can reach std::terminate.
+    try {
+        const int    cid  = session->id();
+        const std::string peer = session->peer_addr();
 
-    // Count online clients for the log message.
-    auto online_count = [this]() {
-        std::lock_guard<std::mutex> lk(registry_mutex_);
-        return clients_.size();
-    };
+        // Count online clients for the log message.
+        auto online_count = [this]() {
+            std::lock_guard<std::mutex> lk(registry_mutex_);
+            return clients_.size();
+        };
 
-    while (true) {
-        MsgType     type;
-        std::string payload;
-        FrameStatus st = recv_frame(session->fd(), type, payload);
+        while (true) {
+            MsgType     type;
+            std::string payload;
+            FrameStatus st = recv_frame(session->fd(), type, payload);
 
-        if (st == FrameStatus::PEER_CLOSED) {
-            remove_client(cid);
-            log("[INFO] Client " + std::to_string(cid) + " disconnected"
-                " (peer closed connection) ("
-                + std::to_string(online_count()) + " online)");
-            return;
+            if (st == FrameStatus::PEER_CLOSED) {
+                remove_client(cid);
+                log("[INFO] Client " + std::to_string(cid) + " disconnected"
+                    " (peer closed connection) ("
+                    + std::to_string(online_count()) + " online)");
+                return;
+            }
+            if (st == FrameStatus::PEER_CLOSED_MIDFRAME) {
+                remove_client(cid);
+                log("[WARN] Client " + std::to_string(cid)
+                    + " disconnected mid-frame (incomplete frame) ("
+                    + std::to_string(online_count()) + " online)");
+                return;
+            }
+            if (st == FrameStatus::IO_ERROR) {
+                remove_client(cid);
+                log("[WARN] Client " + std::to_string(cid)
+                    + " I/O error: " + std::strerror(errno) + " ("
+                    + std::to_string(online_count()) + " online)");
+                return;
+            }
+            if (st == FrameStatus::PROTOCOL_VIOLATION) {
+                remove_client(cid);
+                log("[WARN] Client " + std::to_string(cid)
+                    + " protocol violation – dropping ("
+                    + std::to_string(online_count()) + " online)");
+                ::shutdown(session->fd(), SHUT_RDWR);
+                return;
+            }
+
+            // st == OK; type == CHAT (recv_frame already validated it).
+            if (payload.empty()) continue; // skip empty messages
+
+            // Build "[HH:MM] [Client N]: <text>" using localtime_r (thread-safe;
+            // the POSIX version of localtime uses thread-local storage).
+            char tbuf[8];
+            std::time_t t = std::time(nullptr);
+            std::tm tm_buf{};
+            localtime_r(&t, &tm_buf);
+            std::strftime(tbuf, sizeof(tbuf), "%H:%M", &tm_buf);
+
+            std::string msg = std::string("[") + tbuf + "] [Client "
+                            + std::to_string(cid) + "]: " + payload;
+
+            broadcast(cid, MsgType::CHAT, msg);
         }
-        if (st == FrameStatus::PEER_CLOSED_MIDFRAME) {
-            remove_client(cid);
-            log("[WARN] Client " + std::to_string(cid)
-                + " disconnected mid-frame (truncated frame) ("
-                + std::to_string(online_count()) + " online)");
-            return;
-        }
-        if (st == FrameStatus::IO_ERROR) {
-            remove_client(cid);
-            log("[WARN] Client " + std::to_string(cid)
-                + " I/O error: " + std::strerror(errno) + " ("
-                + std::to_string(online_count()) + " online)");
-            return;
-        }
-        if (st == FrameStatus::PROTOCOL_VIOLATION) {
-            remove_client(cid);
-            log("[WARN] Client " + std::to_string(cid)
-                + " protocol violation – dropping ("
-                + std::to_string(online_count()) + " online)");
-            ::shutdown(session->fd(), SHUT_RDWR);
-            return;
-        }
-
-        // st == OK; type == CHAT (recv_frame already validated it).
-        if (payload.empty()) continue; // skip empty messages
-
-        // Build "[HH:MM] [Client N]: <text>" using localtime_r (thread-safe;
-        // the POSIX version of localtime uses thread-local storage).
-        char tbuf[8];
-        std::time_t t = std::time(nullptr);
-        std::tm tm_buf{};
-        localtime_r(&t, &tm_buf);
-        std::strftime(tbuf, sizeof(tbuf), "%H:%M", &tm_buf);
-
-        std::string msg = std::string("[") + tbuf + "] [Client "
-                        + std::to_string(cid) + "]: " + payload;
-
-        broadcast(cid, MsgType::CHAT, msg);
+    } catch (const std::exception& e) {
+        remove_client(session->id());
+        log("[ERROR] Client " + std::to_string(session->id())
+            + " thread exception: " + e.what());
+    } catch (...) {
+        remove_client(session->id());
+        log("[ERROR] Client " + std::to_string(session->id())
+            + " thread unknown exception");
     }
 }
 

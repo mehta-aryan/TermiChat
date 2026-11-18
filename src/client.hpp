@@ -29,6 +29,7 @@ private:
     std::string         host_;
     uint16_t            port_;
     std::atomic<bool>   running_{true};
+    std::atomic<bool>   user_eof_{false};
     int                 exit_code_{0};
     std::thread         recv_thread_;
 

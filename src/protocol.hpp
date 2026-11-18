@@ -27,7 +27,7 @@ enum class MsgType : uint8_t {
 enum class FrameStatus {
     OK,
     PEER_CLOSED,          // clean TCP FIN arrived between frames
-    PEER_CLOSED_MIDFRAME, // FIN arrived while reading the payload – truncated
+    PEER_CLOSED_MIDFRAME, // FIN arrived while reading the payload – incomplete frame
     PROTOCOL_VIOLATION,   // bad length field or unknown type
     IO_ERROR,             // errno preserved from the failing recv/send
 };
@@ -38,5 +38,5 @@ enum class FrameStatus {
 FrameStatus send_frame(int fd, MsgType type, const std::string& payload);
 
 // recv_frame: reads the 4-byte header, validates the length before allocating,
-// then reads the body.  Distinguishes clean close from mid-frame truncation.
+// then reads the body.  Distinguishes clean close from mid-frame incomplete frame.
 FrameStatus recv_frame(int fd, MsgType& out_type, std::string& out_payload);

@@ -63,32 +63,44 @@ Client::Client(const std::string& host, uint16_t port)
 
 // ── Receiver thread ───────────────────────────────────────────────────────────
 void Client::receiver_loop() {
-    while (running_.load()) {
-        MsgType     type;
-        std::string payload;
-        FrameStatus st = recv_frame(sock_.fd(), type, payload);
+    try {
+        while (running_.load()) {
+            MsgType     type;
+            std::string payload;
+            FrameStatus st = recv_frame(sock_.fd(), type, payload);
 
-        if (st == FrameStatus::OK) {
-            // Payload is binary-safe: printed with write() semantics via cout.
-            std::cout << payload << '\n';
+            if (st == FrameStatus::OK) {
+                // Payload is binary-safe: printed with write() semantics via cout.
+                std::cout << payload << '\n';
+                std::cout.flush();
+                continue;
+            }
+
+            // If the user ended input cleanly (Ctrl+D), do not treat peer closure as an error.
+            if (user_eof_.load()) {
+                return;
+            }
+
+            // Any non-OK status means the server connection is gone unexpectedly.
+            running_.store(false);
+            exit_code_ = 1;
+
+            if (st == FrameStatus::PEER_CLOSED) {
+                std::cout << "*** Server closed the connection\n";
+            } else if (st == FrameStatus::PEER_CLOSED_MIDFRAME) {
+                std::cout << "*** Server closed the connection (mid-frame)\n";
+            } else if (st == FrameStatus::IO_ERROR) {
+                std::cout << "*** Connection error: " << std::strerror(errno) << '\n';
+            } else {
+                std::cout << "*** Protocol error from server\n";
+            }
             std::cout.flush();
-            continue;
         }
-
-        // Any non-OK status means the server connection is gone.
-        running_.store(false);
-        exit_code_ = 1;
-
-        if (st == FrameStatus::PEER_CLOSED) {
-            std::cout << "*** Server closed the connection\n";
-        } else if (st == FrameStatus::PEER_CLOSED_MIDFRAME) {
-            std::cout << "*** Server closed the connection (mid-frame)\n";
-        } else if (st == FrameStatus::IO_ERROR) {
-            std::cout << "*** Connection error: " << std::strerror(errno) << '\n';
-        } else {
-            std::cout << "*** Protocol error from server\n";
+    } catch (...) {
+        if (!user_eof_.load()) {
+            running_.store(false);
+            exit_code_ = 1;
         }
-        std::cout.flush();
     }
 }
 
@@ -121,7 +133,11 @@ int Client::run() {
         }
         if (ret == 0) continue; // timeout – loop back to check running_
 
-        if (!(pfd.revents & POLLIN)) continue;
+        if (pfd.revents & POLLERR) break;
+        // On a pipe or FIFO, when the peer closes the write end and no data
+        // remains, poll() reports POLLHUP (without POLLIN).  We must check
+        // both so that EOF triggers a read() that returns 0.
+        if (!(pfd.revents & (POLLIN | POLLHUP))) continue;
 
         // read() may give us multiple lines or a partial line in one call.
         ssize_t n = ::read(STDIN_FILENO, read_buf, sizeof(read_buf));
@@ -170,13 +186,13 @@ int Client::run() {
         }
     }
 
-    // If we exited because the user closed stdin (not because server died),
-    // keep the success exit code.
-    if (!running_.load()) {
-        // Server died; exit_code_ was set by receiver_loop.
-    } else {
-        // User EOF: signal receiver thread to stop, then join.
+    // If the loop ended due to stdin EOF (Ctrl+D), record that this was a clean
+    // user-initiated exit so the receiver thread does not treat connection shutdown
+    // as a failure.
+    if (stdin_eof) {
+        user_eof_.store(true);
         running_.store(false);
+        exit_code_ = 0;
     }
 
     // shutdown() sends a TCP FIN to the server and unblocks the receiver

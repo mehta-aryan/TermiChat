@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
-# tests/smoke_test.sh – multi-client integration test using the real binaries.
+# tests/smoke_test.sh – multi-client integration test using real binaries.
 #
 # Usage: bash tests/smoke_test.sh [run_count]
-#   SERVER_BIN / CLIENT_BIN env vars override default binary paths.
-#   Run from the project root.
-#
-# Client stdin is controlled via regular files + 'tail -f'.
-# Sending a message: append a line to the client's input file.
-# Simulating Ctrl+D (EOF): kill the tail process feeding the client's stdin.
+#   SERVER_BIN / CLIENT_BIN env vars may override default binary paths.
 
 set -uo pipefail
 
@@ -20,12 +15,12 @@ RUN_COUNT="${1:-3}"
 pass_count=0
 fail_count=0
 
-# wait_for <file> <regex> <timeout_secs>
+# wait_for <file> <regex> <timeout_tenths>
+# Polls file for regex every 0.1 s.
 wait_for() {
-    local file="$1" regex="$2" timeout_s="$3"
-    local steps=$(( timeout_s * 10 ))
+    local file="$1" regex="$2" timeout_tenths="$3"
     local i=0
-    while (( i < steps )); do
+    while (( i < timeout_tenths )); do
         if [[ -f "$file" ]] && grep -qE "$regex" "$file" 2>/dev/null; then
             return 0
         fi
@@ -35,26 +30,25 @@ wait_for() {
     return 1
 }
 
-# pick_port: random port 20000-60000
+# pick_port: random port in 20000-60000 (no external tools used)
 pick_port() {
-    local port attempts=0
-    while (( attempts < 10 )); do
-        port=$(( RANDOM % 40001 + 20000 ))
-        if ! ss -tlnH "sport = :$port" 2>/dev/null | grep -q .; then
-            echo "$port"; return 0
-        fi
-        (( attempts++ ))
-    done
-    echo "Could not find free port" >&2; exit 1
+    echo $(( RANDOM % 40001 + 20000 ))
 }
 
 TMPDIR=""
 SERVER_PID=""
 
 cleanup() {
-    [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null || true
+    # Close any open test client file descriptors
+    exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null || true
+
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+    fi
     jobs -p | xargs -r kill -9 2>/dev/null || true
-    [[ -n "$TMPDIR" ]] && rm -rf "$TMPDIR"
+    if [[ -n "${TMPDIR:-}" && -d "$TMPDIR" ]]; then
+        rm -rf "$TMPDIR"
+    fi
 }
 
 run_one() {
@@ -73,273 +67,260 @@ run_one() {
     SERVER_PID=""
     trap cleanup EXIT INT TERM
 
-    # ── Start server ────────────────────────────────────────────────────────
+    # ── Start server (retry up to 10 random ports if port in use) ───────────
     local port
     local attempts=0
     while (( attempts < 10 )); do
         port=$(pick_port)
         "$SERVER_BIN" "$port" > "$TMPDIR/server.log" 2>&1 &
         SERVER_PID=$!
-        if wait_for "$TMPDIR/server.log" "Listening on" 20; then
+        # Wait up to 2 seconds for server to bind and listen
+        if wait_for "$TMPDIR/server.log" "Listening on 0.0.0.0:$port" 20; then
             break
         fi
-        kill "$SERVER_PID" 2>/dev/null
+        kill -9 "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
         SERVER_PID=""
         (( attempts++ ))
     done
-    if [[ -z "$SERVER_PID" ]]; then
-        _fail "Could not start server"
-        return
-    fi
-    _pass "Server started on port $port"
 
-    # ── Client management ────────────────────────────────────────────────────
-    # Each client's stdin comes from: tail -f <input_file> | client
-    # To send a line:   echo msg >> <input_file>
-    # To signal EOF:    kill the tail process
-    declare -A TAIL_PID=()
+    if [[ -z "$SERVER_PID" ]]; then
+        _fail "Server failed to start after 10 attempts"
+        return 1
+    fi
+    _pass "Server listening on port $port"
+
+    # ── FIFO-based client management ────────────────────────────────────────
+    # Assign distinct file descriptors for writing to client FIFOs:
+    # A=3, B=4, C=5, D=6
+    declare -A CLIENT_FD=([A]=3 [B]=4 [C]=5 [D]=6)
     declare -A CLIENT_PID=()
 
     start_client() {
         local name="$1"
-        # Create the input file before tail opens it.
-        touch "$TMPDIR/in_$name.txt"
-        # tail -f follows the file; pipe its output to the client's stdin.
-        # The client's stdout+stderr go to an output log file.
-        tail -f "$TMPDIR/in_$name.txt" \
-            | "$CLIENT_BIN" localhost "$port" \
-              > "$TMPDIR/out_$name.log" 2>&1 &
-        # In a pipeline, the last background job's PID is $!.
-        # We also need the tail PID. Use $BASHPID inside the subshell trick:
-        # Instead, use a temp file to capture tail's PID.
-        TAIL_PID[$name]=$(jobs -p | tail -1)  # last background job = tail
-        CLIENT_PID[$name]=$!
-        # Give the pipeline a moment so we can get the right PIDs.
-        sleep 0.05
-        # Re-capture tail PID more reliably: it's the second-to-last job started.
-        # Actually let's just track PIDs from /proc.
-        # Simplest: capture tail PID by starting it separately.
-        true
-    }
+        local fd="${CLIENT_FD[$name]}"
+        mkfifo "$TMPDIR/fifo_$name"
 
-    # More reliable: start tail and client in a way we can capture both PIDs.
-    start_client2() {
-        local name="$1"
-        touch "$TMPDIR/in_$name.txt"
-        # Start tail in background, capture its PID.
-        tail -f "$TMPDIR/in_$name.txt" > "$TMPDIR/tail_$name.fifo" &
-        TAIL_PID[$name]=$!
-        # Actually piping is simpler. Use mkfifo for the tail→client pipe.
-        mkfifo "$TMPDIR/pipe_$name"
-        tail -f "$TMPDIR/in_$name.txt" > "$TMPDIR/pipe_$name" &
-        TAIL_PID[$name]=$!
+        # Launch client reading stdin from the FIFO.
+        # CRITICAL: Close all client write FDs (3..9) in the child process
+        # so child processes do not inherit the write end of any FIFO!
         "$CLIENT_BIN" localhost "$port" \
-            < "$TMPDIR/pipe_$name" \
-            > "$TMPDIR/out_$name.log" 2>&1 &
+            < "$TMPDIR/fifo_$name" \
+            > "$TMPDIR/out_$name.log" 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
         CLIENT_PID[$name]=$!
+
+        # Open the write end in the parent test shell.
+        eval "exec $fd> \"$TMPDIR/fifo_$name\""
     }
 
     send_msg() {
-        local name="$1" msg="$2"
-        echo "$msg" >> "$TMPDIR/in_$name.txt"
+        local name="$1"
+        local msg="$2"
+        local fd="${CLIENT_FD[$name]}"
+        echo "$msg" >&"$fd"
     }
 
     close_stdin() {
         local name="$1"
-        # Killing tail closes the pipe write end; client sees EOF.
-        kill "${TAIL_PID[$name]}" 2>/dev/null
-        wait "${TAIL_PID[$name]}" 2>/dev/null || true
+        local fd="${CLIENT_FD[$name]}"
+        eval "exec $fd>&-"
     }
 
-    # ── Scenario 1 ──────────────────────────────────────────────────────────
+    # ── Scenario 1: Start clients A, B, C one at a time ─────────────────────
     echo ""
-    echo "── Scenario 1: Connect 3 clients ──"
-
-    start_client2 A
+    echo "── Scenario 1: Connect clients A, B, C ──"
+    start_client A
     wait_for "$TMPDIR/server.log" "Client 1 connected" 20 \
-        && _pass "Client A connected (id 1)" \
-        || _fail "Client A did not connect"
+        && _pass "Client A connected (assigned ID 1)" \
+        || _fail "Client A failed to connect"
 
-    start_client2 B
+    start_client B
     wait_for "$TMPDIR/server.log" "Client 2 connected" 20 \
-        && _pass "Client B connected (id 2)" \
-        || _fail "Client B did not connect"
+        && _pass "Client B connected (assigned ID 2)" \
+        || _fail "Client B failed to connect"
 
-    start_client2 C
+    start_client C
     wait_for "$TMPDIR/server.log" "Client 3 connected" 20 \
-        && _pass "Client C connected (id 3)" \
-        || _fail "Client C did not connect"
+        && _pass "Client C connected (assigned ID 3)" \
+        || _fail "Client C failed to connect"
 
-    # ── Scenario 2 ──────────────────────────────────────────────────────────
+    # ── Scenario 2: A sends; B and C receive; A does not self-echo ───────────
     echo ""
-    echo "── Scenario 2: Broadcast from A ──"
-    sleep 0.2
+    echo "── Scenario 2: Broadcast from Client A ──"
+    sleep 0.1
     send_msg A "hello from A"
-    sleep 0.3
 
-    wait_for "$TMPDIR/out_B.log" '\[Client 1\].*hello from A' 10 \
-        && _pass "B received A's message" \
-        || _fail "B did NOT receive A's message"
+    wait_for "$TMPDIR/out_B.log" '\[Client 1\]: hello from A' 15 \
+        && _pass "Client B received '[Client 1]: hello from A'" \
+        || _fail "Client B did not receive message from A"
 
-    wait_for "$TMPDIR/out_C.log" '\[Client 1\].*hello from A' 10 \
-        && _pass "C received A's message" \
-        || _fail "C did NOT receive A's message"
+    wait_for "$TMPDIR/out_C.log" '\[Client 1\]: hello from A' 15 \
+        && _pass "Client C received '[Client 1]: hello from A'" \
+        || _fail "Client C did not receive message from A"
 
-    if grep -qE '\[Client 1\].*hello from A' "$TMPDIR/out_A.log" 2>/dev/null; then
-        _fail "A received its own message (should not)"
+    if grep -qE '\[Client 1\]: hello from A' "$TMPDIR/out_A.log" 2>/dev/null; then
+        _fail "Client A received its own message (unexpected self-echo)"
     else
-        _pass "A did not receive its own message"
+        _pass "Client A did not receive its own message (no self-echo)"
     fi
 
-    # ── Scenario 3 ──────────────────────────────────────────────────────────
+    # ── Scenario 3: B sends; A and C receive ─────────────────────────────────
     echo ""
-    echo "── Scenario 3: Broadcast from B ──"
+    echo "── Scenario 3: Broadcast from Client B ──"
     send_msg B "greetings from B"
-    sleep 0.3
 
-    wait_for "$TMPDIR/out_A.log" '\[Client 2\].*greetings from B' 10 \
-        && _pass "A received B's message" \
-        || _fail "A did NOT receive B's message"
+    wait_for "$TMPDIR/out_A.log" '\[Client 2\]: greetings from B' 15 \
+        && _pass "Client A received '[Client 2]: greetings from B'" \
+        || _fail "Client A did not receive message from B"
 
-    wait_for "$TMPDIR/out_C.log" '\[Client 2\].*greetings from B' 10 \
-        && _pass "C received B's message" \
-        || _fail "C did NOT receive B's message"
+    wait_for "$TMPDIR/out_C.log" '\[Client 2\]: greetings from B' 15 \
+        && _pass "Client C received '[Client 2]: greetings from B'" \
+        || _fail "Client C did not receive message from B"
 
-    # ── Scenario 4 ──────────────────────────────────────────────────────────
+    # ── Scenario 4: kill -9 C; server survives; A->B still works ─────────────
     echo ""
-    echo "── Scenario 4: kill -9 Client C ──"
-    kill -9 "${CLIENT_PID[C]}" 2>/dev/null
-    kill -9 "${TAIL_PID[C]}" 2>/dev/null
+    echo "── Scenario 4: Abrupt kill -9 of Client C ──"
+    kill -9 "${CLIENT_PID[C]}" 2>/dev/null || true
     wait "${CLIENT_PID[C]}" 2>/dev/null || true
-    wait "${TAIL_PID[C]}"   2>/dev/null || true
 
     wait_for "$TMPDIR/server.log" "Client 3 (disconnected|I/O error)" 30 \
-        && _pass "Server logged C's disconnect" \
-        || _fail "Server did not log C's disconnect"
+        && _pass "Server logged Client 3 disconnect within 3 s" \
+        || _fail "Server did not log Client 3 disconnect within 3 s"
 
     send_msg A "after C killed"
-    sleep 0.3
-    wait_for "$TMPDIR/out_B.log" '\[Client 1\].*after C killed' 10 \
-        && _pass "A->B still works after C killed" \
-        || _fail "A->B broke after C killed"
+    wait_for "$TMPDIR/out_B.log" '\[Client 1\]: after C killed' 15 \
+        && _pass "A -> B broadcast works after C was killed" \
+        || _fail "Broadcast failed after C was killed"
 
-    # ── Scenario 5 ──────────────────────────────────────────────────────────
+    # ── Scenario 5: Client D connects (ID 4) ─────────────────────────────────
     echo ""
-    echo "── Scenario 5: New client D (id 4) ──"
-    start_client2 D
+    echo "── Scenario 5: New Client D connects (ID 4) ──"
+    start_client D
     wait_for "$TMPDIR/server.log" "Client 4 connected" 20 \
-        && _pass "Client D connected (id 4)" \
-        || _fail "Client D did not connect"
+        && _pass "Client D connected (assigned ID 4)" \
+        || _fail "Client D failed to connect"
 
     send_msg D "hello from D"
-    sleep 0.3
+    wait_for "$TMPDIR/out_A.log" '\[Client 4\]: hello from D' 15 \
+        && _pass "Client A received message from D" \
+        || _fail "Client A did not receive message from D"
 
-    wait_for "$TMPDIR/out_A.log" '\[Client 4\].*hello from D' 10 \
-        && _pass "A received D's message" \
-        || _fail "A did NOT receive D's message"
+    wait_for "$TMPDIR/out_B.log" '\[Client 4\]: hello from D' 15 \
+        && _pass "Client B received message from D" \
+        || _fail "Client B did not receive message from D"
 
-    wait_for "$TMPDIR/out_B.log" '\[Client 4\].*hello from D' 10 \
-        && _pass "B received D's message" \
-        || _fail "B did NOT receive D's message"
-
-    # ── Scenario 6 ──────────────────────────────────────────────────────────
+    # ── Scenario 6: Close A's stdin (Ctrl+D); exit 0 within 2 s ─────────────
     echo ""
-    echo "── Scenario 6: Close A's stdin (Ctrl+D) ──"
+    echo "── Scenario 6: Close Client A stdin (Ctrl+D simulation) ──"
     close_stdin A
 
-    local deadline=20
     local elapsed=0
     local a_exited=false
-    while (( elapsed < deadline )); do
+    while (( elapsed < 20 )); do
         if ! kill -0 "${CLIENT_PID[A]}" 2>/dev/null; then
-            a_exited=true; break
+            a_exited=true
+            break
         fi
-        sleep 0.1; (( elapsed++ ))
+        sleep 0.1
+        (( elapsed++ ))
     done
 
     if $a_exited; then
-        wait "${CLIENT_PID[A]}"; local ec=$?
-        (( ec == 0 )) \
-            && _pass "Client A exited 0 after stdin close" \
-            || _fail "Client A exited $ec (expected 0)"
+        wait "${CLIENT_PID[A]}" 2>/dev/null; local ec=$?
+        if (( ec == 0 )); then
+            _pass "Client A exited with code 0 within 2 s"
+        else
+            _fail "Client A exited with code $ec (expected 0)"
+        fi
     else
-        kill "${CLIENT_PID[A]}" 2>/dev/null; wait "${CLIENT_PID[A]}" 2>/dev/null || true
+        kill -9 "${CLIENT_PID[A]}" 2>/dev/null || true
         _fail "Client A did not exit within 2 s of stdin close"
     fi
 
     wait_for "$TMPDIR/server.log" "Client 1 disconnected" 20 \
-        && _pass "Server logged A's disconnect" \
-        || _fail "Server did not log A's disconnect"
+        && _pass "Server logged Client 1 disconnect" \
+        || _fail "Server did not log Client 1 disconnect"
 
-    # ── Scenario 7 ──────────────────────────────────────────────────────────
+    # ── Scenario 7: NUL byte + non-ASCII bytes ────────────────────────────────
     echo ""
-    echo "── Scenario 7: NUL + non-ASCII bytes ──"
-    printf 'caf\xc3\xa9\x00byte\n' >> "$TMPDIR/in_B.txt"
+    echo "── Scenario 7: Message with NUL and non-ASCII bytes ──"
+    printf 'caf\xc3\xa9\x00extra\n' >&"${CLIENT_FD[B]}"
     sleep 0.4
     if kill -0 "$SERVER_PID" 2>/dev/null; then
-        _pass "Server alive after NUL/non-ASCII message"
+        _pass "Server survived NUL and non-ASCII binary payload"
     else
-        _fail "Server crashed on NUL/non-ASCII message"
+        _fail "Server crashed on NUL and non-ASCII payload"
     fi
 
-    # ── Scenario 8 ──────────────────────────────────────────────────────────
+    # ── Scenario 8: Bad port / port already in use ───────────────────────────
     echo ""
-    echo "── Scenario 8: Bad port / port in use ──"
-    "$CLIENT_BIN" localhost 1 > /dev/null 2>&1; local ec_bad=$?
-    (( ec_bad != 0 )) \
-        && _pass "Client to bad port exits non-zero (ec=$ec_bad)" \
-        || _fail "Client to bad port exited 0 (should be non-zero)"
+    echo "── Scenario 8: Error handling (bad port / port in use) ──"
+    # Port 1 (privileged / unusable or refused)
+    "$CLIENT_BIN" localhost 1 > "$TMPDIR/bad_client.log" 2>&1 || local ec_bad=$?
+    if (( ec_bad != 0 )) && grep -qiE "connect|error" "$TMPDIR/bad_client.log" 2>/dev/null; then
+        _pass "Client to closed port exited non-zero with error message"
+    else
+        _fail "Client to closed port did not exit properly"
+    fi
 
-    "$SERVER_BIN" "$port" > /dev/null 2>&1; local ec2=$?
-    (( ec2 != 0 )) \
-        && _pass "Second server on used port exits non-zero (ec=$ec2)" \
-        || _fail "Second server on used port exited 0 (should be non-zero)"
+    # Second server attempting to bind same port
+    "$SERVER_BIN" "$port" > "$TMPDIR/dup_server.log" 2>&1 || local ec_dup=$?
+    if (( ec_dup != 0 )) && grep -qiE "bind|address already in use" "$TMPDIR/dup_server.log" 2>/dev/null; then
+        _pass "Second server on used port exited non-zero with bind error message"
+    else
+        _fail "Second server on used port did not fail as expected"
+    fi
 
-    # ── Scenario 9 ──────────────────────────────────────────────────────────
+    # ── Scenario 9: kill -TERM server; remaining clients exit 1 within 3 s ───
     echo ""
     echo "── Scenario 9: kill -TERM server ──"
     kill -TERM "$SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
 
-    local b_done=false d_done=false
+    local b_exited=false d_exited=false
     local countdown=30
     while (( countdown > 0 )); do
-        ! kill -0 "${CLIENT_PID[B]}" 2>/dev/null && b_done=true
-        ! kill -0 "${CLIENT_PID[D]}" 2>/dev/null && d_done=true
-        $b_done && $d_done && break
-        sleep 0.1; (( countdown-- ))
+        ! kill -0 "${CLIENT_PID[B]}" 2>/dev/null && b_exited=true
+        ! kill -0 "${CLIENT_PID[D]}" 2>/dev/null && d_exited=true
+        $b_exited && $d_exited && break
+        sleep 0.1
+        (( countdown-- ))
     done
 
-    if $b_done; then
-        wait "${CLIENT_PID[B]}"; local eb=$?
-        (( eb == 1 )) \
-            && _pass "Client B exited 1 after server TERM" \
-            || _fail "Client B exited $eb (expected 1)"
+    if $b_exited; then
+        wait "${CLIENT_PID[B]}" 2>/dev/null; local ec_b=$?
+        if (( ec_b == 1 )); then
+            _pass "Client B exited with code 1 within 3 s"
+        else
+            _fail "Client B exited with code $ec_b (expected 1)"
+        fi
     else
-        kill "${CLIENT_PID[B]}" 2>/dev/null; wait "${CLIENT_PID[B]}" 2>/dev/null || true
+        kill -9 "${CLIENT_PID[B]}" 2>/dev/null || true
         _fail "Client B did not exit within 3 s"
     fi
 
-    if $d_done; then
-        wait "${CLIENT_PID[D]}"; local ed=$?
-        (( ed == 1 )) \
-            && _pass "Client D exited 1 after server TERM" \
-            || _fail "Client D exited $ed (expected 1)"
+    if $d_exited; then
+        wait "${CLIENT_PID[D]}" 2>/dev/null; local ec_d=$?
+        if (( ec_d == 1 )); then
+            _pass "Client D exited with code 1 within 3 s"
+        else
+            _fail "Client D exited with code $ec_d (expected 1)"
+        fi
     else
-        kill "${CLIENT_PID[D]}" 2>/dev/null; wait "${CLIENT_PID[D]}" 2>/dev/null || true
+        kill -9 "${CLIENT_PID[D]}" 2>/dev/null || true
         _fail "Client D did not exit within 3 s"
     fi
 
     wait_for "$TMPDIR/out_B.log" "Server closed" 10 \
-        && _pass "Client B printed 'Server closed'" \
+        && _pass "Client B printed 'Server closed' notice" \
         || _fail "Client B did not print 'Server closed'"
 
     wait_for "$TMPDIR/out_D.log" "Server closed" 10 \
-        && _pass "Client D printed 'Server closed'" \
+        && _pass "Client D printed 'Server closed' notice" \
         || _fail "Client D did not print 'Server closed'"
 
+    # ── Summary for this run ─────────────────────────────────────────────────
     echo ""
     echo "Run $run_num result: $run_pass passed, $run_fail failed"
     (( pass_count += run_pass ))
@@ -347,11 +328,17 @@ run_one() {
 
     trap - EXIT INT TERM
     cleanup
-    TMPDIR=""; SERVER_PID=""
+    TMPDIR=""
+    SERVER_PID=""
+
+    [[ $run_fail -eq 0 ]]
 }
 
 for i in $(seq 1 "$RUN_COUNT"); do
-    run_one "$i"
+    if ! run_one "$i"; then
+        echo "Run $i failed!"
+        exit 1
+    fi
 done
 
 echo ""
