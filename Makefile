@@ -3,9 +3,11 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -O2 -g -pthread -MMD -MP
 LDFLAGS  := -pthread
 
 COMMON := build/src/socket_utils.o build/src/protocol.o build/src/text_utils.o
+# Terminal UI: raw mode and keys, the line editor, and the pure renderer.
+UI     := build/src/terminal.o build/src/line_editor.o build/src/render.o
 SERVER := $(COMMON) build/src/server.o build/src/server_main.o
-CLIENT := $(COMMON) build/src/client.o build/src/client_main.o
-UNIT   := build/test_framing build/test_protocol build/test_text
+CLIENT := $(COMMON) $(UI) build/src/client.o build/src/client_main.o
+UNIT   := build/test_framing build/test_protocol build/test_text build/test_ui
 
 .PHONY: all test clean
 # Keep the intermediate .o files (the unit-test pattern rule below would
@@ -22,6 +24,10 @@ termichat_client: $(CLIENT)
 
 # Each unit test links its own object plus the shared sources.
 build/test_%: build/tests/test_%.o $(COMMON)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+# The UI test also needs the UI modules.
+build/test_ui: build/tests/test_ui.o $(COMMON) $(UI)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 build/%.o: %.cpp

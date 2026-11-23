@@ -1,6 +1,8 @@
 // client.cpp – Client implementation.
 
 #include "client.hpp"
+#include "line_editor.hpp"
+#include "render.hpp"
 #include "text_utils.hpp"
 
 #include <sys/socket.h>   // socket, connect, shutdown
@@ -8,51 +10,183 @@
 #include <unistd.h>       // read, close
 #include <poll.h>         // poll
 
-#include <cstring>        // strerror, memset
-#include <cstdio>         // fprintf, printf
 #include <cerrno>
-#include <iostream>
+#include <cstdio>         // fprintf
+#include <cstring>        // strerror
+#include <exception>
 #include <mutex>
+#include <optional>
 #include <string>
 
-// ── Output ────────────────────────────────────────────────────────────────────
-// show() is the ONLY function that turns a ChatEvent into terminal output, so
-// restyling the UI means changing this one function.  The mutex keeps a line
-// from the receiver thread and a local notice from the main thread apart.
-static std::mutex g_out_mutex;
-
-static void show(const ChatEvent& ev) {
-    std::string line;
-    switch (ev.kind) {
-    case EventKind::Message:
-        line = "[" + format_clock(ev.timestamp) + "] " + ev.sender + ": " + ev.text;
-        break;
-    case EventKind::Private:
-        line = "[" + format_clock(ev.timestamp) + "] [private] " + ev.sender + " -> "
-             + ev.recipient + ": " + ev.text;
-        break;
-    case EventKind::System:
-        line = "*** " + ev.text;
-        break;
-    case EventKind::UserList:
-        line = "*** Online (" + std::to_string(ev.users.size()) + "): "
-             + join_strings(ev.users, ", ");
-        break;
+// ── Screen ────────────────────────────────────────────────────────────────────
+// The ONLY object that writes chat output.  One mutex serialises the receiver
+// thread (incoming events) and the main thread (typing, notices); every update
+// is built as one string and sent with a single write_all(), so a line can
+// never be torn by a keystroke redraw or the other way round.
+//
+// In interactive mode the last terminal row is the input row.  Printing
+// something therefore means: erase that row, print the lines, redraw the row.
+class Screen {
+public:
+    explicit Screen(const TermCaps& caps) {
+        style_.plain   = !caps.interactive;
+        style_.colour  = caps.colour;
+        style_.unicode = caps.utf8;
+        if (caps.interactive) style_.width = terminal_size(STDOUT_FILENO).cols;
     }
-    std::lock_guard<std::mutex> lk(g_out_mutex);
-    std::cout << line << '\n';
-    std::cout.flush();
-}
 
-// A message from the client itself (help, errors) rendered like a server notice.
-static void notice(SystemKind kind, const std::string& text) {
-    ChatEvent ev;
-    ev.kind        = EventKind::System;
-    ev.timestamp   = unix_now();
-    ev.system_kind = kind;
-    ev.text        = text;
-    show(ev);
-}
+    // Fixed after construction, so safe to read from any thread.
+    bool interactive() const { return !style_.plain; }
+
+    // Enters the UI (interactive mode only): signal handlers, raw mode, banner,
+    // prompt.  stop() undoes it; both are safe to call twice.
+    void start(const std::string& me, const std::string& host, uint16_t port) {
+        std::lock_guard<std::mutex> lk(mu_);
+        me_ = me;
+        host_ = host;
+        port_ = port;
+        if (style_.plain) return;
+        signals_.emplace();
+        raw_.emplace(STDIN_FILENO);
+        style_.width = terminal_size(STDOUT_FILENO).cols;
+        active_ = true;
+        write_all(STDOUT_FILENO, banner_locked() + input_row_locked());
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!active_) return;
+        active_ = false;
+        write_all(STDOUT_FILENO, ERASE_ROW);   // leave a clean row for what comes next
+        raw_.reset();                          // terminal back to normal...
+        signals_.reset();                      // ...and the default signal behaviour
+    }
+
+    void show(const ChatEvent& ev) {
+        std::lock_guard<std::mutex> lk(mu_);
+        emit_locked(render_event(ev, me_, style_, names_));
+    }
+
+    void show_help() {
+        std::lock_guard<std::mutex> lk(mu_);
+        emit_locked(render_help(style_, unix_now()));
+    }
+
+    void print(const std::string& line) {
+        std::lock_guard<std::mutex> lk(mu_);
+        emit_locked({line});
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        update_size_locked();
+        write_all(STDOUT_FILENO, "\x1b[2J\x1b[H" + banner_locked() + input_row_locked());
+    }
+
+    // Applies one key to the input line.  Returns true when it completed a
+    // line, which is then in 'submitted' (Ctrl+D on an empty line gives "/quit").
+    bool apply_key(const Key& key, std::string& submitted) {
+        std::lock_guard<std::mutex> lk(mu_);
+        update_size_locked();
+        bool done = false;
+        switch (key.type) {
+        case KeyType::Char:       editor_.insert(key.text); break;
+        case KeyType::Backspace:  editor_.backspace();      break;
+        case KeyType::Delete:     editor_.erase_forward();  break;
+        case KeyType::Left:       editor_.move_left();      break;
+        case KeyType::Right:      editor_.move_right();     break;
+        case KeyType::Home:       editor_.move_home();      break;
+        case KeyType::End:        editor_.move_end();       break;
+        case KeyType::Up:         editor_.history_prev();   break;
+        case KeyType::Down:       editor_.history_next();   break;
+        case KeyType::KillLine:   editor_.kill_line();      break;
+        case KeyType::DeleteWord: editor_.delete_word();    break;
+        case KeyType::Enter:
+            submitted = editor_.submit();
+            done = !submitted.empty();
+            break;
+        case KeyType::EndOfInput:
+            if (editor_.text().empty()) { submitted = "/quit"; done = true; }
+            else editor_.erase_forward();                   // like a shell: Ctrl+D deletes
+            break;
+        case KeyType::Redraw:
+        case KeyType::Escape:     break;                    // the redraw below is the whole job
+        }
+        write_all(STDOUT_FILENO, redraw_locked());
+        return done;
+    }
+
+    // Called regularly from the main loop: picks up a resize.
+    void refresh() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (update_size_locked()) write_all(STDOUT_FILENO, redraw_locked());
+    }
+
+private:
+    static constexpr const char* ERASE_ROW = "\r\x1b[K";    // cursor to column 0, clear the row
+
+    std::mutex   mu_;
+    Style        style_;
+    RenderState  names_;
+    std::string  me_, host_;
+    uint16_t     port_ = 0;
+    LineEditor   editor_{MAX_CHAT_TEXT};
+    std::size_t  scroll_ = 0;                // first visible byte of the input line
+    bool         active_ = false;            // raw mode is on and the input row exists
+    std::optional<SignalGuard> signals_;
+    std::optional<RawMode>     raw_;
+
+    std::string eol() const { return style_.plain ? "\n" : "\r\n"; }
+
+    // Re-reads the window size after a SIGWINCH.  Returns true if it changed.
+    bool update_size_locked() {
+        if (!active_ || !SignalGuard::take_resize()) return false;
+        style_.width = terminal_size(STDOUT_FILENO).cols;
+        return true;
+    }
+
+    std::string lines_locked(const std::vector<std::string>& lines) const {
+        std::string out;
+        for (const std::string& l : lines) out += l + eol();
+        return out;
+    }
+
+    std::string banner_locked() const {
+        return lines_locked(render_banner(host_, port_, me_, style_));
+    }
+
+    // Prompt + visible text, with the terminal cursor moved to the edit position.
+    std::string input_row_locked() {
+        const InputRow row = render_input_row(me_, editor_.text(), editor_.cursor(), scroll_, style_);
+        return row.text + "\x1b[" + std::to_string(row.cursor_col + 1) + "G";
+    }
+
+    std::string redraw_locked() {
+        return active_ ? ERASE_ROW + input_row_locked() : std::string();
+    }
+
+    void emit_locked(const std::vector<std::string>& lines) {
+        update_size_locked();
+        std::string out;
+        if (active_) out += ERASE_ROW;
+        out += lines_locked(lines);
+        if (active_) out += input_row_locked();
+        write_all(STDOUT_FILENO, out);       // ONE write: nothing can end up between the parts
+    }
+};
+
+// Leaves the UI when it goes out of scope, so every way out of Client::run()
+// (return, exception) puts the terminal back.
+class ScreenSession {
+public:
+    ScreenSession(Screen& screen, const std::string& me, const std::string& host, uint16_t port)
+        : screen_(screen) { screen_.start(me, host, port); }
+    ~ScreenSession() { screen_.stop(); }
+    ScreenSession(const ScreenSession&)            = delete;
+    ScreenSession& operator=(const ScreenSession&) = delete;
+private:
+    Screen& screen_;
+};
 
 // Explains why a frame could not be received (shared by join and the receiver).
 static std::string describe_failure(FrameStatus st, int err) {
@@ -109,8 +243,20 @@ Client::Client(const std::string& host, uint16_t port, std::string username)
         throw NetError("connect() to " + host + ":" + port_str);
     }
 
-    std::cout << "Connected to " << host << ":" << port << '\n';
-    std::cout.flush();
+    screen_ = std::make_unique<Screen>(detect_terminal());
+    // The fancy UI shows the address in its banner instead.
+    if (!screen_->interactive()) screen_->print("Connected to " + host + ":" + port_str);
+}
+
+Client::~Client() = default;
+
+void Client::notice(SystemKind kind, const std::string& text) {
+    ChatEvent ev;
+    ev.kind        = EventKind::System;
+    ev.timestamp   = unix_now();
+    ev.system_kind = kind;
+    ev.text        = text;
+    screen_->show(ev);
 }
 
 // ── Joining ───────────────────────────────────────────────────────────────────
@@ -147,38 +293,46 @@ bool Client::join() {
 
 // ── Receiver thread ───────────────────────────────────────────────────────────
 void Client::receiver_loop() {
-    while (running_.load()) {
-        MsgType     type;
-        std::string payload;
-        FrameStatus st = recv_frame(sock_.fd(), type, payload);
-        const int   err = errno;   // only meaningful for IO_ERROR
+    // An exception must not escape a thread (that would be std::terminate with
+    // the terminal still in raw mode), so it ends the session like any failure.
+    try {
+        while (running_.load()) {
+            MsgType     type;
+            std::string payload;
+            FrameStatus st = recv_frame(sock_.fd(), type, payload);
+            const int   err = errno;   // only meaningful for IO_ERROR
 
-        if (st == FrameStatus::OK) {
-            ChatEvent ev;
-            if (make_event(type, payload, ev)) {
-                show(ev);
-                continue;
+            if (st == FrameStatus::OK) {
+                ChatEvent ev;
+                if (make_event(type, payload, ev)) {
+                    sanitize_event(ev);                       // the server is not trusted
+                    if (ev.kind == EventKind::UserList) ev.timestamp = unix_now();
+                    screen_->show(ev);
+                    continue;
+                }
+                // A frame a client must never receive, or a malformed payload.
+                st = FrameStatus::PROTOCOL_VIOLATION;
             }
-            // A frame a client must never receive, or a malformed payload.
-            st = FrameStatus::PROTOCOL_VIOLATION;
-        }
 
-        // Any failure ends the session.  exchange() tells us who got there
-        // first: if running_ was already false, the main thread is quitting on
-        // purpose (/quit, Ctrl+D) and its shutdown() is what woke us up, so
-        // there is nothing to report and the exit code stays 0.
-        if (!running_.exchange(false)) return;
-        exit_code_.store(1);
-        notice(SystemKind::Error, describe_failure(st, err));
+            // Any failure ends the session.  fail() tells us who got there
+            // first: if the main thread was already quitting on purpose
+            // (/quit, Ctrl+D) its shutdown() is what woke us up, so there is
+            // nothing to report and the exit code stays 0.
+            fail(describe_failure(st, err));
+            return;
+        }
+    } catch (const std::exception& e) {
+        fail(std::string("Internal error: ") + e.what());
     }
 }
 
 // ── Helpers used by the main thread ───────────────────────────────────────────
 void Client::fail(const std::string& message) {
-    // Same "who got there first" rule as the receiver: report only once.
+    // The first to flip running_ owns the story: it sets the exit code and the
+    // reason.  run() prints the reason once the terminal is back to normal.
     if (running_.exchange(false)) {
         exit_code_.store(1);
-        notice(SystemKind::Error, message);
+        end_message_ = message;
     }
 }
 
@@ -228,11 +382,7 @@ bool Client::run_command(const std::string& line) {
     const std::string args = (cmd_end == std::string::npos) ? "" : line.substr(cmd_end);
 
     if (cmd == "/help") {
-        notice(SystemKind::Info, "Commands:");
-        notice(SystemKind::Info, "  /help               show this help");
-        notice(SystemKind::Info, "  /users              list who is online");
-        notice(SystemKind::Info, "  /msg <user> <text>  send a private message to one user");
-        notice(SystemKind::Info, "  /quit               leave the chat (Ctrl+D works too)");
+        screen_->show_help();
         return true;
     }
     if (cmd == "/msg")
@@ -243,6 +393,11 @@ bool Client::run_command(const std::string& line) {
             return false;
         }
         return true;                 // the answer arrives through the receiver thread
+    }
+    // Plain mode has no screen to clear, so there /clear stays an unknown command.
+    if (cmd == "/clear" && screen_->interactive()) {
+        screen_->clear();
+        return true;
     }
     if (cmd == "/quit")
         return false;                // run() sends QUIT and shuts the connection down
@@ -273,73 +428,114 @@ bool Client::send_line(std::string line) {
 }
 
 // ── Main loop: stdin → send ───────────────────────────────────────────────────
-int Client::run() {
-    if (!join()) return 1;
+enum class StdinStatus { Data, Idle, Interrupted, Eof, Failed };
 
-    // Start the receiver thread before entering the stdin loop.
-    recv_thread_ = std::thread(&Client::receiver_loop, this);
+// Waits up to 'timeout_ms' for stdin, then reads what is there.
+//
+// poll() + read() instead of std::cin/getline: stream buffering can hide data
+// from poll() (the bytes sit in the C++ library buffer but poll() says
+// "nothing to read").  The timeout lets the caller check 'running_' promptly
+// when the server goes away.
+//
+// When the writer of a pipe/FIFO closes it, poll() reports POLLHUP (not POLLIN)
+// once the data is drained.  A terminal reports POLLIN.  So all three count as
+// "readable": read() then returns 0 on EOF, which is how input ending is found.
+static StdinStatus read_stdin(char* buf, std::size_t cap, int timeout_ms,
+                              ssize_t& n, std::string& error) {
+    pollfd pfd{};
+    pfd.fd     = STDIN_FILENO;
+    pfd.events = POLLIN;
 
-    // We use poll() + read() on STDIN_FILENO instead of std::cin/getline
-    // because stream buffering can hide data from poll() – the bytes sit in
-    // the C++ library buffer but poll() says "nothing to read".
-    // poll() with a 200 ms timeout lets us check 'running' promptly when the
-    // server goes away.
-
-    std::string line_buf;   // accumulates characters across partial reads
-    char read_buf[256];
-    bool stdin_eof = false;
-
-    while (!stdin_eof && running_.load()) {
-        pollfd pfd{};
-        pfd.fd     = STDIN_FILENO;
-        pfd.events = POLLIN;
-
-        int ret = ::poll(&pfd, 1, 200);  // 200 ms timeout
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            fail(std::string("poll() on stdin failed: ") + std::strerror(errno));
-            break;
-        }
-        if (ret == 0) continue; // timeout – loop back to check running_
-
-        // When the writer of a pipe/FIFO closes it, poll() reports POLLHUP
-        // (not POLLIN) once the data is drained.  A real terminal's Ctrl+D
-        // reports POLLIN.  Fall through to read() for all of them: it returns
-        // 0 on EOF, which is how we detect that input has ended.
-        if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) continue;
-
-        // read() may give us multiple lines or a partial line in one call.
-        ssize_t n = ::read(STDIN_FILENO, read_buf, sizeof(read_buf));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            fail(std::string("read() on stdin failed: ") + std::strerror(errno));
-            break;
-        }
-        if (n == 0) {          // EOF (Ctrl+D, or the pipe writer closed)
-            stdin_eof = true;
-            break;
-        }
-
-        bool ok = true;
-        for (ssize_t i = 0; i < n && ok; ++i) {
-            if (read_buf[i] == '\n') {
-                ok = send_line(std::move(line_buf));
-                line_buf.clear();
-            } else {
-                line_buf += read_buf[i];
-            }
-        }
-        if (!ok) break;
+    const int ret = ::poll(&pfd, 1, timeout_ms);
+    if (ret < 0) {
+        if (errno == EINTR) return StdinStatus::Interrupted;
+        error = std::string("poll() on stdin failed: ") + std::strerror(errno);
+        return StdinStatus::Failed;
     }
+    if (ret == 0 || !(pfd.revents & (POLLIN | POLLHUP | POLLERR))) return StdinStatus::Idle;
 
-    // Send the last unterminated line at EOF if it is non-empty.
-    if (stdin_eof && running_.load() && !line_buf.empty())
-        send_line(std::move(line_buf));
+    n = ::read(STDIN_FILENO, buf, cap);    // may hold several lines or half a line
+    if (n < 0) {
+        if (errno == EINTR) return StdinStatus::Interrupted;
+        error = std::string("read() on stdin failed: ") + std::strerror(errno);
+        return StdinStatus::Failed;
+    }
+    return n == 0 ? StdinStatus::Eof : StdinStatus::Data;   // EOF: Ctrl+D, or the pipe writer closed
+}
 
+// How long to wait for the rest of an escape sequence before a lone ESC is
+// taken as the Escape key, and how long to sleep when nothing is going on.
+static constexpr int ESC_WAIT_MS = 50;
+static constexpr int IDLE_WAIT_MS = 200;
+
+// Plain mode: cut the bytes into lines at '\n'; 'line_buf' keeps a half line
+// across reads.
+bool Client::handle_plain(const char* data, std::size_t n, std::string& line_buf) {
+    for (std::size_t i = 0; i < n; ++i) {
+        if (data[i] != '\n') { line_buf += data[i]; continue; }
+        const bool ok = send_line(std::move(line_buf));
+        line_buf.clear();
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// Interactive mode: feed the keys to the editor; every finished line is sent.
+bool Client::handle_keys(const std::vector<Key>& keys) {
+    for (const Key& key : keys) {
+        std::string line;
+        if (screen_->apply_key(key, line) && !send_line(std::move(line))) return false;
+    }
+    return true;
+}
+
+// Ctrl+C, SIGTERM and SIGHUP only set a flag (see SignalGuard); here the main
+// loop turns it into an ordinary user quit.  Also picks up window resizes.
+bool Client::service_terminal() {
+    if (SignalGuard::stop_requested()) return false;
+    screen_->refresh();
+    return true;
+}
+
+void Client::input_loop() {
+    const bool ui = screen_->interactive();
+    std::string line_buf;      // plain mode: text of a line that is not finished yet
+    char buf[256];
+
+    while (running_.load()) {
+        if (ui && !service_terminal()) return;
+
+        ssize_t n = 0;
+        std::string error;
+        const int wait_ms = decoder_.pending() ? ESC_WAIT_MS : IDLE_WAIT_MS;
+        switch (read_stdin(buf, sizeof(buf), wait_ms, n, error)) {
+        case StdinStatus::Interrupted:
+            break;
+        case StdinStatus::Idle:
+            // Nothing followed an ESC in time: it was the Escape key itself.
+            if (ui && decoder_.pending() && !handle_keys(decoder_.flush())) return;
+            break;
+        case StdinStatus::Failed:
+            fail(error);
+            return;
+        case StdinStatus::Eof:
+            // Send the last unterminated line if there is one.
+            if (!ui && running_.load() && !line_buf.empty()) send_line(std::move(line_buf));
+            return;
+        case StdinStatus::Data:
+            if (ui ? !handle_keys(decoder_.feed(buf, static_cast<std::size_t>(n)))
+                   : !handle_plain(buf, static_cast<std::size_t>(n), line_buf))
+                return;
+            break;
+        }
+    }
+}
+
+void Client::disconnect() {
     // Claim the "who ended the session" decision.  If exchange() returns true
-    // the user quit (/quit or Ctrl+D): say goodbye properly so the server can
-    // tell this apart from a crash.  If false, the receiver (or fail()) already
-    // reported a problem and set the exit code.
+    // the user quit (/quit, Ctrl+D, Ctrl+C): say goodbye properly so the server
+    // can tell this apart from a crash.  If false, the receiver (or fail())
+    // already recorded a problem and set the exit code.
     if (running_.exchange(false))
         send_frame(sock_.fd(), MsgType::QUIT, "");
 
@@ -348,6 +544,20 @@ int Client::run() {
     ::shutdown(sock_.fd(), SHUT_RDWR);
 
     if (recv_thread_.joinable()) recv_thread_.join();
+}
 
+int Client::run() {
+    if (!join()) return 1;
+
+    {
+        // The UI (raw mode, banner, prompt) lives exactly as long as this block.
+        ScreenSession session(*screen_, username_, host_, port_);
+        recv_thread_ = std::thread(&Client::receiver_loop, this);
+        input_loop();
+        disconnect();
+    }   // terminal restored here, on every way out
+
+    // Only now, in normal terminal mode, say why the session failed.
+    if (!end_message_.empty()) notice(SystemKind::Error, end_message_);
     return exit_code_.load();
 }
