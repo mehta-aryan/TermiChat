@@ -27,6 +27,10 @@ static void show(const ChatEvent& ev) {
     case EventKind::Message:
         line = "[" + format_clock(ev.timestamp) + "] " + ev.sender + ": " + ev.text;
         break;
+    case EventKind::Private:
+        line = "[" + format_clock(ev.timestamp) + "] [private] " + ev.sender + " -> "
+             + ev.recipient + ": " + ev.text;
+        break;
     case EventKind::System:
         line = "*** " + ev.text;
         break;
@@ -178,17 +182,61 @@ void Client::fail(const std::string& message) {
     }
 }
 
+// Splits the argument part of "/msg <user> <text>": the user is the first
+// word, the text is everything after it with its leading whitespace removed.
+// Returns false if either is missing.
+static bool split_msg_args(const std::string& args, std::string& user, std::string& text) {
+    constexpr const char* WS = " \t";
+    const std::size_t user_start = args.find_first_not_of(WS);
+    if (user_start == std::string::npos) return false;
+    const std::size_t user_end = args.find_first_of(WS, user_start);
+    if (user_end == std::string::npos) return false;
+    const std::size_t text_start = args.find_first_not_of(WS, user_end);
+    if (text_start == std::string::npos) return false;
+    user = args.substr(user_start, user_end - user_start);
+    text = args.substr(text_start);
+    return true;
+}
+
+bool Client::send_private(const std::string& args) {
+    std::string user, text;
+    if (!split_msg_args(args, user, text)) {
+        notice(SystemKind::Error, "Usage: /msg <user> <text>");
+        return true;
+    }
+    // Same checks the server makes, so a typo costs no round trip.
+    const NameCheck check = check_username(user);
+    if (check != NameCheck::Ok) {
+        notice(SystemKind::Error, std::string("Invalid username: ") + name_problem(check));
+        return true;
+    }
+    if (text.size() > MAX_CHAT_TEXT) {
+        notice(SystemKind::Error, "Message too long (max 1024 bytes), not sent");
+        return true;
+    }
+    if (send_frame(sock_.fd(), MsgType::PRIV_SAY, encode_priv_say(user, text)) != FrameStatus::OK) {
+        fail(std::string("Send failed: ") + std::strerror(errno));
+        return false;
+    }
+    return true;       // the confirmation comes back through the receiver thread
+}
+
 bool Client::run_command(const std::string& line) {
-    // The command is the first word; anything after it is ignored for now.
-    const std::string cmd = line.substr(0, line.find_first_of(" \t"));
+    // The command is the first word; the rest (if any) is its arguments.
+    const std::size_t cmd_end = line.find_first_of(" \t");
+    const std::string cmd  = line.substr(0, cmd_end);
+    const std::string args = (cmd_end == std::string::npos) ? "" : line.substr(cmd_end);
 
     if (cmd == "/help") {
         notice(SystemKind::Info, "Commands:");
-        notice(SystemKind::Info, "  /help   show this help");
-        notice(SystemKind::Info, "  /users  list who is online");
-        notice(SystemKind::Info, "  /quit   leave the chat (Ctrl+D works too)");
+        notice(SystemKind::Info, "  /help               show this help");
+        notice(SystemKind::Info, "  /users              list who is online");
+        notice(SystemKind::Info, "  /msg <user> <text>  send a private message to one user");
+        notice(SystemKind::Info, "  /quit               leave the chat (Ctrl+D works too)");
         return true;
     }
+    if (cmd == "/msg")
+        return send_private(args);
     if (cmd == "/users") {
         if (send_frame(sock_.fd(), MsgType::LIST_REQ, "") != FrameStatus::OK) {
             fail(std::string("Send failed: ") + std::strerror(errno));

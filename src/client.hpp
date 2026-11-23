@@ -7,7 +7,7 @@
 // Threading model:
 //   Receiver thread: loops on recv_frame, turns each frame into a ChatEvent
 //                    and hands it to show() (the only place that prints chat).
-//   Main thread:     reads stdin via poll(), sends SAY frames and runs /commands.
+//   Main thread:     reads stdin via poll(), sends SAY / PRIV_SAY frames and runs /commands.
 //
 // The 'running' atomic flag links the two threads and also records WHO ended
 // the session.  Whichever thread flips it from true to false first "wins":
@@ -53,6 +53,10 @@ private:
     // asked to quit.
     bool send_line(std::string line);
     bool run_command(const std::string& line);
+
+    // /msg: 'args' is everything after the command word.  Shows a local notice
+    // (and sends nothing) for bad input; otherwise sends one PRIV_SAY.
+    bool send_private(const std::string& args);
 
     // Called when the main thread itself detects a fatal problem.
     void fail(const std::string& message);

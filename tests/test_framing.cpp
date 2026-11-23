@@ -144,8 +144,8 @@ static void test_unknown_type() {
         check(read_one(q.b, t, out) == FrameStatus::PROTOCOL_VIOLATION, "type 0 -> PROTOCOL_VIOLATION");
     }
     {
-        Pair q; write_raw(q.a, raw_frame(2, 10, "x"));
-        check(read_one(q.b, t, out) == FrameStatus::PROTOCOL_VIOLATION, "type 10 (first unassigned) -> PROTOCOL_VIOLATION");
+        Pair q; write_raw(q.a, raw_frame(2, 12, "x"));
+        check(read_one(q.b, t, out) == FrameStatus::PROTOCOL_VIOLATION, "type 12 (first unassigned) -> PROTOCOL_VIOLATION");
     }
     {
         Pair q; write_raw(q.a, raw_frame(2, 1, "x"));   // 1 was CHAT in v1, now JOIN: valid
@@ -154,13 +154,14 @@ static void test_unknown_type() {
 }
 
 static void test_all_types() {
-    std::puts("Test 6b: every v2 type survives send_frame -> recv_frame with its number");
+    std::puts("Test 6b: every type survives send_frame -> recv_frame with its number");
     const struct { MsgType type; uint8_t number; const char* name; } all[] = {
         {MsgType::JOIN, 1, "JOIN"},         {MsgType::JOIN_OK, 2, "JOIN_OK"},
         {MsgType::JOIN_ERR, 3, "JOIN_ERR"}, {MsgType::SAY, 4, "SAY"},
         {MsgType::MSG, 5, "MSG"},           {MsgType::SYSTEM, 6, "SYSTEM"},
         {MsgType::LIST_REQ, 7, "LIST_REQ"}, {MsgType::LIST_RES, 8, "LIST_RES"},
-        {MsgType::QUIT, 9, "QUIT"},
+        {MsgType::QUIT, 9, "QUIT"},         {MsgType::PRIV_SAY, 10, "PRIV_SAY"},
+        {MsgType::PRIV_MSG, 11, "PRIV_MSG"},
     };
     for (const auto& e : all) {
         Pair p; MsgType t; std::string out;

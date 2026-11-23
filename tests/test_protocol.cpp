@@ -1,4 +1,5 @@
-// tests/test_protocol.cpp – unit tests for the v2 payload codecs and ChatEvent.
+// tests/test_protocol.cpp – unit tests for the payload codecs (incl. private
+// messages) and ChatEvent.
 // No sockets involved: these are pure string functions.
 
 #include "check.hpp"
@@ -36,6 +37,57 @@ static void test_msg_codec() {
     check(decode_msg("123456789012345678|alice|hi", ts, sender, text) && ts == 123456789012345678LL,
           "18-digit timestamp accepted");
     check(!decode_msg("5||hi", ts, sender, text), "empty sender rejected");
+}
+
+static void test_priv_say_codec() {
+    std::puts("Test 1b: PRIV_SAY  <target>|<text>");
+    check(encode_priv_say("bob", "hi") == "bob|hi", "encode_priv_say builds exactly bob|hi");
+
+    std::string target, text;
+    check(decode_priv_say("bob|hello there", target, text) && target == "bob" && text == "hello there",
+          "plain private message decodes");
+    check(decode_priv_say("bob|a|b||c|", target, text) && target == "bob" && text == "a|b||c|",
+          "text containing '|' keeps every '|' (split on the FIRST one only)");
+    check(decode_priv_say("bob||", target, text) && target == "bob" && text == "|",
+          "text that is just '|' survives");
+    check(decode_priv_say("bob|", target, text) && target == "bob" && text.empty(),
+          "empty text decodes (the server answers it with an error notice)");
+
+    const std::string uni = "caf\xc3\xa9 \xe2\x98\x83 \xf0\x9f\x98\x80";
+    check(decode_priv_say(encode_priv_say("amy_1", uni), target, text) && target == "amy_1" && text == uni,
+          "UTF-8 text round-trips byte for byte");
+
+    check(!decode_priv_say("", target, text), "empty payload rejected");
+    check(!decode_priv_say("bob", target, text), "no separator rejected");
+    check(!decode_priv_say("|hi", target, text), "empty target rejected");
+    check(!decode_priv_say("|", target, text), "lone separator rejected");
+}
+
+static void test_priv_msg_codec() {
+    std::puts("Test 1c: PRIV_MSG  <unix_ts>|<from>|<to>|<text>");
+    check(encode_priv_msg(1700000000, "alice", "bob", "psst") == "1700000000|alice|bob|psst",
+          "encode_priv_msg builds exactly 1700000000|alice|bob|psst");
+
+    int64_t ts = 0; std::string from, to, text;
+    check(decode_priv_msg("1700000000|alice|bob|psst", ts, from, to, text) &&
+          ts == 1700000000 && from == "alice" && to == "bob" && text == "psst", "plain message decodes");
+    check(decode_priv_msg("5|a|b|x|y||z|", ts, from, to, text) && from == "a" && to == "b" && text == "x|y||z|",
+          "text containing '|' keeps every '|' (split on the first 3 only)");
+    check(decode_priv_msg("5|a|b|", ts, from, to, text) && text.empty(), "empty text field is allowed");
+
+    const std::string uni = "\xe2\x98\x83 caf\xc3\xa9";
+    check(decode_priv_msg(encode_priv_msg(7, "a", "b", uni), ts, from, to, text) && text == uni,
+          "UTF-8 text round-trips byte for byte");
+
+    check(!decode_priv_msg("", ts, from, to, text), "empty payload rejected");
+    check(!decode_priv_msg("5|a|b", ts, from, to, text), "only two separators rejected");
+    check(!decode_priv_msg("5|a", ts, from, to, text), "only one separator rejected");
+    check(!decode_priv_msg("|a|b|hi", ts, from, to, text), "empty timestamp rejected");
+    check(!decode_priv_msg("x5|a|b|hi", ts, from, to, text), "non-numeric timestamp rejected");
+    check(!decode_priv_msg("-5|a|b|hi", ts, from, to, text), "negative timestamp rejected");
+    check(!decode_priv_msg("1234567890123456789|a|b|hi", ts, from, to, text), "19-digit timestamp rejected");
+    check(!decode_priv_msg("5||b|hi", ts, from, to, text), "empty sender rejected");
+    check(!decode_priv_msg("5|a||hi", ts, from, to, text), "empty recipient rejected");
 }
 
 static void test_system_codec() {
@@ -100,12 +152,17 @@ static void test_make_event() {
           "LIST_RES -> UserList event");
 
     const MsgType not_for_clients[] = {MsgType::JOIN, MsgType::JOIN_OK, MsgType::JOIN_ERR,
-                                       MsgType::SAY, MsgType::LIST_REQ, MsgType::QUIT};
+                                       MsgType::SAY, MsgType::PRIV_SAY, MsgType::LIST_REQ, MsgType::QUIT};
     bool rejected = true;
     for (MsgType t : not_for_clients) rejected = rejected && !make_event(t, "1|info|x", ev);
     check(rejected, "types that never travel to a client are rejected");
 
+    check(make_event(MsgType::PRIV_MSG, "1700000000|alice|bob|a|b", ev) &&
+          ev.kind == EventKind::Private && ev.timestamp == 1700000000 && ev.sender == "alice" &&
+          ev.recipient == "bob" && ev.text == "a|b", "PRIV_MSG -> Private event with from/to");
+
     check(!make_event(MsgType::MSG, "garbage", ev), "malformed MSG rejected");
+    check(!make_event(MsgType::PRIV_MSG, "5|alice|bob", ev), "malformed PRIV_MSG rejected");
     check(!make_event(MsgType::SYSTEM, "1|nope|x", ev), "malformed SYSTEM rejected");
     check(!make_event(MsgType::LIST_RES, "a,,b", ev), "malformed LIST_RES rejected");
 }
@@ -114,23 +171,34 @@ static void test_size_invariant() {
     std::puts("Test 5: a worst-case relayed MSG never exceeds MAX_PAYLOAD");
     const std::string payload = encode_msg(9999999999LL, std::string(16, 'n'), std::string(MAX_CHAT_TEXT, 'x'));
     check(payload.size() <= MAX_PAYLOAD, "1024-byte text + 16-char name + timestamp fits one frame");
+
+    const std::string priv = encode_priv_msg(9999999999LL, std::string(16, 'n'), std::string(16, 'm'),
+                                             std::string(MAX_CHAT_TEXT, 'x'));
+    check(priv.size() <= MAX_PAYLOAD, "worst-case PRIV_MSG (two 16-char names) fits one frame");
+    check(encode_priv_say(std::string(16, 'n'), std::string(MAX_CHAT_TEXT, 'x')).size() <= MAX_PAYLOAD,
+          "worst-case PRIV_SAY fits one frame");
 }
 
 static void test_type_numbers() {
-    std::puts("Test 6: message type numbers are the protocol v2 table");
+    std::puts("Test 6: message type numbers are the protocol table");
     check(static_cast<int>(MsgType::JOIN) == 1 && static_cast<int>(MsgType::JOIN_OK) == 2 &&
           static_cast<int>(MsgType::JOIN_ERR) == 3 && static_cast<int>(MsgType::SAY) == 4 &&
           static_cast<int>(MsgType::MSG) == 5 && static_cast<int>(MsgType::SYSTEM) == 6 &&
           static_cast<int>(MsgType::LIST_REQ) == 7 && static_cast<int>(MsgType::LIST_RES) == 8 &&
           static_cast<int>(MsgType::QUIT) == 9, "JOIN=1 ... QUIT=9");
-    check(!is_known_type(0) && is_known_type(1) && is_known_type(9) && !is_known_type(10) && !is_known_type(255),
-          "is_known_type accepts exactly 1..9");
+    check(static_cast<int>(MsgType::PRIV_SAY) == 10 && static_cast<int>(MsgType::PRIV_MSG) == 11,
+          "PRIV_SAY=10, PRIV_MSG=11");
+    check(!is_known_type(0) && is_known_type(1) && is_known_type(9) && is_known_type(10) &&
+          is_known_type(11) && !is_known_type(12) && !is_known_type(255),
+          "is_known_type accepts exactly 1..11");
 }
 
 int main() {
     std::puts("=== test_protocol ===");
     test_type_numbers();
     test_msg_codec();
+    test_priv_say_codec();
+    test_priv_msg_codec();
     test_system_codec();
     test_user_list_codec();
     test_make_event();

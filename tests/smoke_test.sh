@@ -8,7 +8,7 @@
 # each FIFO open (fds 3-8); closing that fd is how we deliver EOF ("Ctrl+D").
 # Raw protocol cases use bash's built-in /dev/tcp, not an external tool; the
 # frames are written by hand as  | 4-byte length | type | payload |  with
-# types JOIN=1 SAY=4 LIST_REQ=7 QUIT=9.
+# types JOIN=1 SAY=4 LIST_REQ=7 QUIT=9 PRIV_SAY=10.
 
 SERVER_BIN=${SERVER_BIN:-./termichat_server}
 CLIENT_BIN=${CLIENT_BIN:-./termichat_client}
@@ -218,6 +218,7 @@ run_once() {
     check "/users lists everyone" wait_for "$T/out_bob" "*** Online (3): alice, bob, carol" 3
     say bob "/help"
     check "/help is answered locally" wait_for "$T/out_bob" "*** Commands:" 3
+    check "/help lists /msg" wait_for "$T/out_bob" "/msg <user> <text>" 3
     say bob "/nonsense arg"
     check "unknown command" wait_for "$T/out_bob" "*** Unknown command: /nonsense (try /help)" 3
     say bob "marker-5"
@@ -225,7 +226,96 @@ run_once() {
     check "no command text was sent as chat" bash -c \
         '! grep -aqE "/users|/help|/nonsense" "$1"' _ "$T/out_alice"
 
-    echo "── 6: same name in a different case is refused"
+    echo "── 6: private messages (/msg)"
+    say alice "/msg bob secret one"
+    check "bob got '[HH:MM] [private] alice -> bob: secret one'" \
+        wait_for_re "$T/out_bob" '^\[[0-9]{2}:[0-9]{2}\] \[private\] alice -> bob: secret one$' 3
+    check "alice got the same line back (confirmation)" \
+        wait_for_re "$T/out_alice" '^\[[0-9]{2}:[0-9]{2}\] \[private\] alice -> bob: secret one$' 3
+    say alice "marker-6a"
+    check "carol has received the public marker that followed" wait_for "$T/out_carol" "alice: marker-6a" 3
+    check "carol never saw the private text" not_contains carol "secret one"
+
+    say alice "/msg BOB via upper"
+    check "a target in another case is accepted, names shown canonically" \
+        wait_for "$T/out_bob" "] [private] alice -> bob: via upper" 3
+    say bob "/msg alice got it"
+    check "bob -> alice works too" wait_for "$T/out_alice" "] [private] bob -> alice: got it" 3
+    say alice "/msg bob   pipes a|b||c café ☃"
+    check "'|', UTF-8 and the stripped leading spaces survive" \
+        wait_for "$T/out_bob" "alice -> bob: pipes a|b||c café ☃" 3
+    printf '/msg bob a\x1b[31mred\x07!\n' >&"${CFD[alice]}"
+    check "ESC and BEL are stripped from private text" wait_for "$T/out_bob" "alice -> bob: a[31mred!" 3
+    check "no ESC byte reached bob" not_contains bob $'\x1b'
+    check "no BEL byte reached bob" not_contains bob $'\x07'
+
+    say alice "/msg nobody hello"
+    check "unknown user -> error to the sender" wait_for "$T/out_alice" "*** No such user: nobody" 3
+    say alice "/msg alice me"
+    say alice "/msg ALICE me too"
+    check "a message to yourself is refused, in any case" \
+        wait_for_count "$T/out_alice" "*** You can't send a private message to yourself" 2 3
+    printf '/msg bob \x1b\x07\n' >&"${CFD[alice]}"
+    check "text that is empty after sanitising -> error" wait_for "$T/out_alice" "*** Message is empty" 3
+    say alice "/msg"
+    say alice "/msg bob"
+    say alice "/msg bob   "
+    check "missing user or text -> local usage line (3 times)" \
+        wait_for_count "$T/out_alice" "*** Usage: /msg <user> <text>" 3 3
+    say alice "/msg bad!name hi"
+    check "an invalid username is refused locally" \
+        wait_for "$T/out_alice" "*** Invalid username: Username may only contain" 3
+
+    big=$(head -c 1024 /dev/zero | tr '\0' x)
+    say alice "/msg bob $big"
+    check "a 1024-byte private message is delivered" \
+        wait_for_re "$T/out_bob" "\] \[private\] alice -> bob: x{1024}\$" 3
+    big=$(head -c 1025 /dev/zero | tr '\0' z)
+    say alice "/msg bob $big"
+    check "a 1025-byte private message is refused locally (second 'too long' notice)" \
+        wait_for_count "$T/out_alice" "*** Message too long (max 1024 bytes), not sent" 2 3
+    say alice "marker-6b"
+    check "bob sees the marker" wait_for "$T/out_bob" "alice: marker-6b" 3
+    check "the 1025-byte text never reached bob" not_contains bob "zzzzzzzz"
+    check "alice was not disconnected for it" alive "${CPID[alice]}"
+
+    check "errors, usage lines and local refusals sent nothing: 6 successful messages in the log" \
+        wait_for_count "$T/server.log" " private message (" 6 3
+    check "...and not one more" test "$(grep -acF " private message (" "$T/server.log")" -eq 6
+    check "log line carries only metadata: 'alice -> bob private message (10 bytes)'" \
+        wait_for_re "$T/server.log" 'INFO\] alice -> bob private message \(10 bytes\)$' 3
+    check "the server log never contains private text" bash -c \
+        '! grep -aqE "secret one|via upper|got it|pipes|café|red!|xxxxxxxx" "$1"' _ "$T/server.log"
+    say bob "marker-6c"
+    check "carol has received the last public marker" wait_for "$T/out_carol" "bob: marker-6c" 3
+    check "carol saw no private line at all" not_contains carol "[private]"
+
+    echo "── 6b: 3 senders x 50 private messages to one recipient, concurrently"
+    check "rex joined" start_client rex 7
+    local who n burst_pids=()
+    for who in alice bob carol; do
+        ( for n in $(seq 1 50); do say "$who" "/msg rex burst-$who-$n"; done ) &
+        burst_pids+=($!)
+    done
+    { wait "${burst_pids[@]}"; } 2>/dev/null
+    check "rex received 150 private lines" wait_for_count "$T/out_rex" "[private]" 150 15
+    check "all 150 are well-formed, none interleaved" test "$(grep -acE \
+        '^\[[0-9]{2}:[0-9]{2}\] \[private\] (alice|bob|carol) -> rex: burst-\1-[0-9]+$' "$T/out_rex")" -eq 150
+    for who in alice bob carol; do
+        check "$who's 50 messages arrived exactly once each, in order" \
+            test "$(grep -a " $who -> rex: " "$T/out_rex" | sed 's/.*-//' | paste -sd,)" = "$(seq -s, 1 50)"
+        check "$who got her/his 50 confirmations back" \
+            wait_for_count "$T/out_$who" "-> rex: burst-$who-" 50 5
+    done
+    close_stdin rex
+    if wait_exit "${CPID[rex]}" 3; then
+        check "rex leaves cleanly on EOF (code $EXIT_CODE)" test "$EXIT_CODE" -eq 0
+    else
+        fail "rex did not exit on EOF"
+    fi
+    check "server logged rex's quit" wait_for_re "$T/server.log" 'INFO\] rex left \(quit\)' 3
+
+    echo "── 7: same name in a different case is refused"
     launch_client dup 7 ALICE
     if wait_exit "${CPID[dup]}" 3; then
         check "ALICE exits with code 1 (got $EXIT_CODE)" test "$EXIT_CODE" -eq 1
@@ -238,7 +328,8 @@ run_once() {
         wait_for_re "$T/server.log" 'WARN\] 127\.0\.0\.1:[0-9]+ rejected: Username already taken$' 3
     check "alice is still the owner of the name" alive "${CPID[alice]}"
 
-    echo "── 7: invalid and reserved names are refused by the server (raw JOIN frames)"
+    echo "── 8: invalid and reserved names are refused by the server (raw JOIN frames)"
+    local joins_before; joins_before=$(count_of alice "joined the chat")
     raw_reply '\x00\x00\x00\x09\x01bad name'
     check "space in name -> reason sent" reply_has "may only contain"
     raw_reply '\x00\x00\x00\x07\x01SERVER'
@@ -253,9 +344,9 @@ run_once() {
     check "name with an ESC byte -> reason sent" reply_has "may only contain"
     check "server logged all 7 rejections (1 duplicate + 6 raw)" wait_for_count "$T/server.log" " rejected: " 7 3
     check "no ESC byte ever reached the server log" bash -c '! grep -aqF "$2" "$1"' _ "$T/server.log" $'\x1b'
-    check "none of these was announced as a join" test "$(count_of alice "joined the chat")" -eq 2
+    check "none of these was announced as a join" test "$(count_of alice "joined the chat")" -eq "$joins_before"
 
-    echo "── 8: two simultaneous JOINs of the same name: exactly one wins"
+    echo "── 9: two simultaneous JOINs of the same name: exactly one wins"
     launch_client r1 7 racer
     launch_client r2 8 Racer
     local i=0 won=0 lost=0
@@ -285,7 +376,7 @@ run_once() {
         fail "the winner did not exit on EOF"
     fi
 
-    echo "── 9: /quit exits 0 and the others see the leave notice"
+    echo "── 10: /quit exits 0 and the others see the leave notice"
     say carol "/quit"
     if wait_exit "${CPID[carol]}" 3; then
         check "carol exited within 3 s with code 0 (got $EXIT_CODE)" test "$EXIT_CODE" -eq 0
@@ -298,7 +389,7 @@ run_once() {
     check "server logged '[INFO] carol left (quit) (n online)'" \
         wait_for_re "$T/server.log" 'INFO\] carol left \(quit\) \([0-9]+ online\)$' 3
 
-    echo "── 10: stdin EOF (Ctrl+D) behaves like /quit"
+    echo "── 11: stdin EOF (Ctrl+D) behaves like /quit"
     check "erin joined" start_client erin 7
     close_stdin erin
     if wait_exit "${CPID[erin]}" 3; then
@@ -310,7 +401,7 @@ run_once() {
     check "alice saw '*** erin left the chat'" wait_for "$T/out_alice" "*** erin left the chat" 3
     check "server logged erin's quit" wait_for_re "$T/server.log" 'INFO\] erin left \(quit\)' 3
 
-    echo "── 11: kill -9 of bob: the others get a 'lost connection' notice"
+    echo "── 12: kill -9 of bob: the others get a 'lost connection' notice"
     kill -9 "${CPID[bob]}"; { wait "${CPID[bob]}"; } 2>/dev/null; close_stdin bob
     check "alice saw '*** bob lost connection'" wait_for "$T/out_alice" "*** bob lost connection" 3
     check "server logged a WARN for bob's departure" wait_for_re "$T/server.log" 'WARN\] bob left \(' 3
@@ -321,7 +412,7 @@ run_once() {
     say alice "hi dave"
     check "alice -> dave works" wait_for "$T/out_dave" "alice: hi dave" 3
 
-    echo "── 12: protocol abuse by raw clients (server must survive, others unaffected)"
+    echo "── 13: protocol abuse by raw clients (server must survive, others unaffected)"
     local lost_before; lost_before=$(grep -acE 'left the chat|lost connection' "$T/out_alice")
     raw_send ''
     check "connect-and-hang-up before JOIN is logged" wait_for "$T/server.log" "rejected: connection closed before JOIN" 3
@@ -332,6 +423,8 @@ run_once() {
     check "LIST_REQ / QUIT before JOIN -> dropped" wait_for_count "$T/server.log" "rejected: expected JOIN as the first frame" 3 3
     raw_send '\x00\x00\x00\x02\x02x'
     check "a server-only type (JOIN_OK) as first frame -> dropped" wait_for_count "$T/server.log" "rejected: expected JOIN as the first frame" 4 3
+    raw_send '\x00\x00\x00\x07\x0abob|hi'
+    check "PRIV_SAY before JOIN -> dropped" wait_for_count "$T/server.log" "rejected: expected JOIN as the first frame" 5 3
     raw_send '\xff\xff\xff\xff'
     check "length 0xFFFFFFFF -> dropped" wait_for "$T/server.log" "rejected: protocol violation (bad length or unknown type)" 3
     raw_send '\x00\x00\x00\x02\x7fx'
@@ -343,14 +436,27 @@ run_once() {
     raw_send '\x00\x00\x00\x09\x01bigmouth\x00\x00\x08\x01\x04' 2048
     check "2048-byte SAY after joining (valid frame, too long) -> dropped" \
         wait_for "$T/server.log" "bigmouth left (protocol violation (chat text longer than 1024 bytes))" 3
-    raw_send '\x00\x00\x00\x08\x01mallory\x00\x00\x00\x0c\x04a\x1b[31mred\x07!'
+    raw_send '\x00\x00\x00\x09\x01pmgreedy\x00\x00\x04\x08\x0aalice|' 1025
+    check "1025-byte PRIV_SAY text after joining -> dropped" \
+        wait_for "$T/server.log" "pmgreedy left (protocol violation (private text longer than 1024 bytes))" 3
+    raw_send '\x00\x00\x00\x08\x01pmnosep\x00\x00\x00\x04\x0abob'
+    check "PRIV_SAY without a separator -> dropped" \
+        wait_for "$T/server.log" "pmnosep left (protocol violation (malformed PRIV_SAY))" 3
+    raw_send '\x00\x00\x00\x09\x01pmbadtgt\x00\x00\x00\x07\x0ab d|hi'
+    check "PRIV_SAY to an invalid username -> dropped" \
+        wait_for "$T/server.log" "pmbadtgt left (protocol violation (invalid private-message target))" 3
+    raw_send '\x00\x00\x00\x08\x01mallory\x00\x00\x00\x0c\x04a\x1b[31mred\x07!\x00\x00\x00\x12\x0adave|a\x1b[31mpriv\x07!'
     check "alice saw mallory join" wait_for "$T/out_alice" "*** mallory joined the chat" 3
     check "ESC and BEL are stripped for receivers" wait_for "$T/out_dave" "mallory: a[31mred!" 3
+    check "...also in a private message" wait_for "$T/out_dave" "] [private] mallory -> dave: a[31mpriv!" 3
     check "no ESC byte reached dave" not_contains dave $'\x1b'
     check "no BEL byte reached dave" not_contains dave $'\x07'
     check "an abusive joined client is reported as 'lost connection'" wait_for "$T/out_alice" "*** bigmouth lost connection" 3
     check "alice saw twice lost connection" wait_for "$T/out_alice" "*** twice lost connection" 3
     check "alice saw mallory lost connection" wait_for "$T/out_alice" "*** mallory lost connection" 3
+    check "alice saw pmgreedy lost connection" wait_for "$T/out_alice" "*** pmgreedy lost connection" 3
+    check "alice saw pmnosep lost connection" wait_for "$T/out_alice" "*** pmnosep lost connection" 3
+    check "alice saw pmbadtgt lost connection" wait_for "$T/out_alice" "*** pmbadtgt lost connection" 3
     check "server process still alive" alive "$SERVER_PID"
     say alice "still here"
     check "alice -> dave still works after the abuse" wait_for "$T/out_dave" "alice: still here" 3
@@ -360,10 +466,11 @@ run_once() {
     check "nobody got a 'Protocol error'" bash -c \
         '! grep -aqF "Protocol error" "$1" && ! grep -aqF "Protocol error" "$2"' _ "$T/out_alice" "$T/out_dave"
     check "a client that never joined produced no leave notice" \
-        test "$(grep -acE 'left the chat|lost connection' "$T/out_alice")" -eq $(( lost_before + 3 ))
-    # (+3: twice, bigmouth and mallory joined, then left; pre-JOIN violators gave no notice)
+        test "$(grep -acE 'left the chat|lost connection' "$T/out_alice")" -eq $(( lost_before + 6 ))
+    # (+6: twice, bigmouth, the three pm* clients and mallory joined, then left;
+    #  pre-JOIN violators gave no notice)
 
-    echo "── 13: error paths"
+    echo "── 14: error paths"
     local dead=$(( PORT + 1 ))
     while (exec 9<>"/dev/tcp/127.0.0.1/$dead") 2>/dev/null; do dead=$((dead + 1)); done
     local out ec before after
@@ -395,7 +502,7 @@ run_once() {
     after=$(grep -acF " connected" "$T/server.log")
     check "bad usernames were refused locally (no connection was made)" test "$before" -eq "$after"
 
-    echo "── 14: server killed with SIGTERM while clients are connected"
+    echo "── 15: server killed with SIGTERM while clients are connected"
     kill -TERM "$SERVER_PID"
     for c in alice dave; do
         if wait_exit "${CPID[$c]}" 3; then

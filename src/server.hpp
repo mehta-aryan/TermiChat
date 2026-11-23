@@ -107,8 +107,14 @@ private:
                    const std::string& payload);
 
     // Sends one frame to one session; on failure logs and shuts its socket down
-    // (its own thread then notices and cleans up).
-    void deliver(const SessionPtr& session, MsgType type, const std::string& payload);
+    // (its own thread then notices and cleans up).  Returns false on failure.
+    bool deliver(const SessionPtr& session, MsgType type, const std::string& payload);
+
+    // Tells ONE user something went wrong (a SYSTEM frame of kind error).
+    void send_error(const SessionPtr& session, const std::string& text);
+
+    // The joined session registered under 'name' (any letter case), or null.
+    SessionPtr find_user(const std::string& name);
     void report_send_failure(const ClientSession& session, FrameStatus status, int err);
 
     // Entry point for the per-client detached thread.  Catches every
@@ -125,6 +131,7 @@ private:
                                            const std::string& payload);
     std::optional<Disconnect> handle_join(const SessionPtr& session, const std::string& name);
     std::optional<Disconnect> handle_say(const SessionPtr& session, const std::string& payload);
+    std::optional<Disconnect> handle_priv_say(const SessionPtr& session, const std::string& payload);
     void                      handle_list(const SessionPtr& session);
 
     // Answers a failed JOIN with JOIN_ERR; the caller then drops the connection.

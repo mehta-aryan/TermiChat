@@ -9,7 +9,7 @@
 
 bool is_known_type(uint8_t raw) {
     return raw >= static_cast<uint8_t>(MsgType::JOIN) &&
-           raw <= static_cast<uint8_t>(MsgType::QUIT);
+           raw <= static_cast<uint8_t>(MsgType::PRIV_MSG);
 }
 
 FrameStatus send_frame(int fd, MsgType type, const std::string& payload) {
@@ -134,6 +134,36 @@ bool decode_msg(const std::string& payload, int64_t& timestamp,
     return true;
 }
 
+std::string encode_priv_say(const std::string& target, const std::string& text) {
+    return target + '|' + text;
+}
+
+bool decode_priv_say(const std::string& payload, std::string& target, std::string& text) {
+    std::vector<std::string> f;
+    if (!split_fields(payload, '|', 2, f)) return false;
+    if (f[0].empty()) return false;
+    target = std::move(f[0]);
+    text   = std::move(f[1]);
+    return true;
+}
+
+std::string encode_priv_msg(int64_t timestamp, const std::string& from,
+                            const std::string& to, const std::string& text) {
+    return std::to_string(timestamp) + '|' + from + '|' + to + '|' + text;
+}
+
+bool decode_priv_msg(const std::string& payload, int64_t& timestamp, std::string& from,
+                     std::string& to, std::string& text) {
+    std::vector<std::string> f;
+    if (!split_fields(payload, '|', 4, f)) return false;
+    if (!parse_timestamp(f[0], timestamp)) return false;
+    if (f[1].empty() || f[2].empty()) return false;
+    from = std::move(f[1]);
+    to   = std::move(f[2]);
+    text = std::move(f[3]);
+    return true;
+}
+
 std::string encode_system(int64_t timestamp, SystemKind kind, const std::string& text) {
     return std::to_string(timestamp) + '|' + system_kind_name(kind) + '|' + text;
 }
@@ -172,6 +202,10 @@ bool make_event(MsgType type, const std::string& payload, ChatEvent& out) {
     case MsgType::MSG:
         ev.kind = EventKind::Message;
         if (!decode_msg(payload, ev.timestamp, ev.sender, ev.text)) return false;
+        break;
+    case MsgType::PRIV_MSG:
+        ev.kind = EventKind::Private;
+        if (!decode_priv_msg(payload, ev.timestamp, ev.sender, ev.recipient, ev.text)) return false;
         break;
     case MsgType::SYSTEM:
         ev.kind = EventKind::System;

@@ -91,6 +91,12 @@ std::vector<SessionPtr> Server::snapshot() {
     return sessions_of(clients_);
 }
 
+SessionPtr Server::find_user(const std::string& name) {
+    std::lock_guard<std::mutex> lk(registry_mutex_);
+    const auto it = clients_.find(to_lower(name));
+    return it == clients_.end() ? nullptr : it->second;     // copy out, then unlock
+}
+
 // ── Sending ───────────────────────────────────────────────────────────────────
 void Server::report_send_failure(const ClientSession& session, FrameStatus status, int err) {
     const std::string who = session.joined() ? session.name() : session.peer_addr();
@@ -103,12 +109,16 @@ void Server::report_send_failure(const ClientSession& session, FrameStatus statu
     ::shutdown(session.fd(), SHUT_RDWR);
 }
 
-void Server::deliver(const SessionPtr& session, MsgType type, const std::string& payload) {
+bool Server::deliver(const SessionPtr& session, MsgType type, const std::string& payload) {
     const FrameStatus st = session->send_frame(type, payload);
-    if (st != FrameStatus::OK) {
-        const int err = errno;   // capture before anything else can change it
-        report_send_failure(*session, st, err);
-    }
+    if (st == FrameStatus::OK) return true;
+    const int err = errno;   // capture before anything else can change it
+    report_send_failure(*session, st, err);
+    return false;
+}
+
+void Server::send_error(const SessionPtr& session, const std::string& text) {
+    deliver(session, MsgType::SYSTEM, encode_system(unix_now(), SystemKind::Error, text));
 }
 
 void Server::broadcast(const std::vector<SessionPtr>& targets, MsgType type,
@@ -191,6 +201,55 @@ Server::handle_say(const SessionPtr& session, const std::string& payload) {
     return std::nullopt;
 }
 
+std::optional<Server::Disconnect>
+Server::handle_priv_say(const SessionPtr& session, const std::string& payload) {
+    std::string target, raw_text;
+    if (!decode_priv_say(payload, target, raw_text))
+        return Disconnect{false, "protocol violation (malformed PRIV_SAY)"};
+    // Same limit as SAY, on the RAW text.  The client checks the target before
+    // sending, so a bad one can only come from a hand-made client.
+    if (raw_text.size() > MAX_CHAT_TEXT)
+        return Disconnect{false, "protocol violation (private text longer than "
+                                 + std::to_string(MAX_CHAT_TEXT) + " bytes)"};
+    if (check_username(target) != NameCheck::Ok)
+        return Disconnect{false, "protocol violation (invalid private-message target)"};
+
+    const std::string text = sanitize_text(raw_text);
+    if (text.empty()) {
+        send_error(session, "Message is empty");
+        return std::nullopt;
+    }
+    if (to_lower(target) == to_lower(session->name())) {
+        send_error(session, "You can't send a private message to yourself");
+        return std::nullopt;
+    }
+    const SessionPtr recipient = find_user(target);   // registry lock already released
+    if (!recipient) {
+        send_error(session, "No such user: " + target);   // target passed check_username: safe to echo
+        return std::nullopt;
+    }
+
+    // Why two sends are safe: the registry lock is gone, so no lock is held
+    // across I/O.  Each send takes only ITS OWN session's send_mutex, one after
+    // the other and never both at once, so two users messaging each other at
+    // the same moment cannot deadlock, and frames never interleave on a socket.
+    // 'recipient' is a shared_ptr copy, so its fd cannot be closed or reused
+    // while we write.  A relayed text is never longer than the raw text, so the
+    // frame always fits MAX_PAYLOAD.  The sender's copy goes last: no
+    // confirmation is shown for a message that was not delivered.
+    const std::string frame = encode_priv_msg(unix_now(), session->name(), recipient->name(), text);
+    if (!deliver(recipient, MsgType::PRIV_MSG, frame)) {
+        send_error(session, recipient->name() + " is no longer online");
+        return std::nullopt;
+    }
+    deliver(session, MsgType::PRIV_MSG, frame);
+
+    // Privacy: the log gets who and how much, never what.
+    log("[INFO] " + session->name() + " -> " + recipient->name()
+        + " private message (" + std::to_string(text.size()) + " bytes)");
+    return std::nullopt;
+}
+
 void Server::handle_list(const SessionPtr& session) {
     std::vector<std::string> names;
     for (const SessionPtr& s : snapshot()) names.push_back(s->name());
@@ -207,6 +266,8 @@ Server::handle_frame(const SessionPtr& session, MsgType type, const std::string&
     switch (type) {
     case MsgType::SAY:
         return handle_say(session, payload);
+    case MsgType::PRIV_SAY:
+        return handle_priv_say(session, payload);
     case MsgType::LIST_REQ:
         if (!payload.empty()) return Disconnect{false, "protocol violation (LIST_REQ has a payload)"};
         handle_list(session);
@@ -216,7 +277,7 @@ Server::handle_frame(const SessionPtr& session, MsgType type, const std::string&
         return Disconnect{true, "quit"};
     case MsgType::JOIN:
         return Disconnect{false, "protocol violation (JOIN sent twice)"};
-    default:    // JOIN_OK, JOIN_ERR, MSG, SYSTEM, LIST_RES only travel server -> client
+    default:    // JOIN_OK, JOIN_ERR, MSG, PRIV_MSG, SYSTEM, LIST_RES only travel server -> client
         return Disconnect{false, "protocol violation (message type not allowed from a client)"};
     }
 }
