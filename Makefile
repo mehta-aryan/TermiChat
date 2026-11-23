@@ -2,12 +2,15 @@ CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -O2 -g -pthread -MMD -MP
 LDFLAGS  := -pthread
 
-COMMON := build/src/socket_utils.o build/src/protocol.o
+COMMON := build/src/socket_utils.o build/src/protocol.o build/src/text_utils.o
 SERVER := $(COMMON) build/src/server.o build/src/server_main.o
 CLIENT := $(COMMON) build/src/client.o build/src/client_main.o
-TESTS  := $(COMMON) build/tests/test_framing.o
+UNIT   := build/test_framing build/test_protocol build/test_text
 
 .PHONY: all test clean
+# Keep the intermediate .o files (the unit-test pattern rule below would
+# otherwise make make delete the test objects after linking).
+.SECONDARY:
 
 all: termichat_server termichat_client
 
@@ -17,17 +20,17 @@ termichat_server: $(SERVER)
 termichat_client: $(CLIENT)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-build/test_framing: $(TESTS)
+# Each unit test links its own object plus the shared sources.
+build/test_%: build/tests/test_%.o $(COMMON)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 build/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-# Unit test first, then the multi-client smoke test (3 consecutive runs).
-test: all build/test_framing
-	@echo "=== Running test_framing ==="
-	build/test_framing
+# Unit tests first, then the multi-client smoke test (3 consecutive runs).
+test: all $(UNIT)
+	@for t in $(UNIT); do echo "=== Running $$t ==="; $$t || exit 1; done
 	@echo "=== Running smoke_test.sh (3 runs) ==="
 	bash tests/smoke_test.sh 3
 

@@ -4,6 +4,7 @@
 // by hand here, independently of send_frame(), so an encoder bug cannot hide
 // behind a matching decoder bug.
 
+#include "check.hpp"
 #include "../src/socket_utils.hpp"
 #include "../src/protocol.hpp"
 
@@ -20,14 +21,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-// ── Tiny check helper ────────────────────────────────────────────────────────
-static int g_pass = 0, g_fail = 0;
-
-static void check(bool cond, const char* label) {
-    std::printf("  %s: %s\n", cond ? "PASS" : "FAIL", label);
-    cond ? ++g_pass : ++g_fail;
-}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 struct Pair {
@@ -53,9 +46,9 @@ static std::string raw_frame(uint32_t length, uint8_t type, const std::string& p
     return f;
 }
 
-// A well-formed CHAT frame for 'payload'.
-static std::string good_frame(const std::string& payload) {
-    return raw_frame(1 + static_cast<uint32_t>(payload.size()), 1, payload);
+// A well-formed frame (type SAY unless told otherwise) for 'payload'.
+static std::string good_frame(const std::string& payload, uint8_t type = 4) {
+    return raw_frame(1 + static_cast<uint32_t>(payload.size()), type, payload);
 }
 
 static void write_raw(Socket& s, const std::string& bytes) {
@@ -72,27 +65,27 @@ static void test_round_trip() {
     Pair p;
     MsgType t; std::string out;
 
-    check(send_frame(p.a.fd(), MsgType::CHAT, "hello") == FrameStatus::OK, "send_frame returns OK");
+    check(send_frame(p.a.fd(), MsgType::SAY, "hello") == FrameStatus::OK, "send_frame returns OK");
     check(read_one(p.b, t, out) == FrameStatus::OK, "recv_frame returns OK");
-    check(t == MsgType::CHAT && out == "hello", "type and payload match");
+    check(t == MsgType::SAY && out == "hello", "type and payload match");
 
     const std::string binary("a\0b\xff\xc3\xa9", 6);   // NUL and non-ASCII bytes
-    send_frame(p.a.fd(), MsgType::CHAT, binary);
+    send_frame(p.a.fd(), MsgType::SAY, binary);
     check(read_one(p.b, t, out) == FrameStatus::OK && out == binary,
           "payload with NUL / non-ASCII bytes survives unchanged");
 
-    send_frame(p.a.fd(), MsgType::CHAT, "");
+    send_frame(p.a.fd(), MsgType::SAY, "");
     check(read_one(p.b, t, out) == FrameStatus::OK && out.empty(), "empty payload is a valid frame");
 }
 
 static void test_header_bytes() {
-    std::puts("Test 2: wire format is big-endian: 00 00 00 03 01 68 69");
+    std::puts("Test 2: wire format is big-endian: 00 00 00 03 04 68 69");
     Pair p;
-    send_frame(p.a.fd(), MsgType::CHAT, "hi");
+    send_frame(p.a.fd(), MsgType::SAY, "hi");
     unsigned char buf[7] = {};
     check(recv_all(p.b.fd(), buf, 7) == IOStatus::OK, "7 bytes on the wire (4 length + 1 type + 2 payload)");
-    const unsigned char want[7] = {0x00, 0x00, 0x00, 0x03, 0x01, 'h', 'i'};
-    check(std::memcmp(buf, want, 7) == 0, "bytes are exactly 00 00 00 03 01 68 69");
+    const unsigned char want[7] = {0x00, 0x00, 0x00, 0x03, 0x04, 'h', 'i'};
+    check(std::memcmp(buf, want, 7) == 0, "bytes are exactly 00 00 00 03 04 68 69 (type 4 = SAY)");
 }
 
 static void test_fragmentation() {
@@ -146,6 +139,42 @@ static void test_unknown_type() {
     Pair p; MsgType t; std::string out;
     write_raw(p.a, raw_frame(2, 0x7f, "x"));
     check(read_one(p.b, t, out) == FrameStatus::PROTOCOL_VIOLATION, "type 0x7f -> PROTOCOL_VIOLATION");
+    {
+        Pair q; write_raw(q.a, raw_frame(2, 0, "x"));
+        check(read_one(q.b, t, out) == FrameStatus::PROTOCOL_VIOLATION, "type 0 -> PROTOCOL_VIOLATION");
+    }
+    {
+        Pair q; write_raw(q.a, raw_frame(2, 10, "x"));
+        check(read_one(q.b, t, out) == FrameStatus::PROTOCOL_VIOLATION, "type 10 (first unassigned) -> PROTOCOL_VIOLATION");
+    }
+    {
+        Pair q; write_raw(q.a, raw_frame(2, 1, "x"));   // 1 was CHAT in v1, now JOIN: valid
+        check(read_one(q.b, t, out) == FrameStatus::OK && t == MsgType::JOIN, "type 1 is JOIN in protocol v2");
+    }
+}
+
+static void test_all_types() {
+    std::puts("Test 6b: every v2 type survives send_frame -> recv_frame with its number");
+    const struct { MsgType type; uint8_t number; const char* name; } all[] = {
+        {MsgType::JOIN, 1, "JOIN"},         {MsgType::JOIN_OK, 2, "JOIN_OK"},
+        {MsgType::JOIN_ERR, 3, "JOIN_ERR"}, {MsgType::SAY, 4, "SAY"},
+        {MsgType::MSG, 5, "MSG"},           {MsgType::SYSTEM, 6, "SYSTEM"},
+        {MsgType::LIST_REQ, 7, "LIST_REQ"}, {MsgType::LIST_RES, 8, "LIST_RES"},
+        {MsgType::QUIT, 9, "QUIT"},
+    };
+    for (const auto& e : all) {
+        Pair p; MsgType t; std::string out;
+        const std::string payload = (e.type == MsgType::QUIT || e.type == MsgType::LIST_REQ) ? "" : "x|y,z";
+        unsigned char wire[16] = {};
+        send_frame(p.a.fd(), e.type, payload);
+        const std::size_t want = 5 + payload.size();
+        recv_all(p.b.fd(), wire, want);
+        const std::string label = std::string(e.name) + " is type byte " + std::to_string(e.number);
+        check(wire[4] == e.number, label.c_str());
+        write_raw(p.a, std::string(reinterpret_cast<char*>(wire), want));
+        const std::string label2 = std::string(e.name) + " decodes back to the same type and payload";
+        check(read_one(p.b, t, out) == FrameStatus::OK && t == e.type && out == payload, label2.c_str());
+    }
 }
 
 static void test_closes() {
@@ -181,7 +210,7 @@ static void test_bytes_read_count() {
 static void test_send_limits() {
     std::puts("Test 9: send_frame never emits a frame receivers would reject");
     Pair p; MsgType t; std::string out;
-    check(send_frame(p.a.fd(), MsgType::CHAT, std::string(MAX_PAYLOAD + 1, 'x')) == FrameStatus::PROTOCOL_VIOLATION,
+    check(send_frame(p.a.fd(), MsgType::SAY, std::string(MAX_PAYLOAD + 1, 'x')) == FrameStatus::PROTOCOL_VIOLATION,
           "payload > MAX_PAYLOAD is refused");
     p.a = Socket(-1);
     check(read_one(p.b, t, out) == FrameStatus::PEER_CLOSED, "nothing was written to the socket");
@@ -245,11 +274,11 @@ int main() {
     test_coalescing();
     test_invalid_lengths();
     test_unknown_type();
+    test_all_types();
     test_closes();
     test_bytes_read_count();
     test_send_limits();
     test_large_transfer();
     test_eintr();
-    std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+    return summary();
 }
