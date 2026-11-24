@@ -1,9 +1,11 @@
 # TermiChat
 
-A multi-client chat for the terminal, written in **C++17** on raw **POSIX sockets**
-and threads. One server relays messages between any number of clients over TCP.
-It was built for a Computer Networks lab, so the code and this README explain
-*why* each system call is there.
+A multi-client chat application for the terminal, written in **C++17** using raw
+**POSIX sockets** and threads. One server relays messages between any number of
+clients over TCP. The implementation and this README document the networking,
+concurrency, and terminal I/O decisions behind it.
+
+Made by [mehta-aryan](https://github.com/mehta-aryan).
 
 Licensed under the MIT License (see `LICENSE`).
 
@@ -39,15 +41,15 @@ Licensed under the MIT License (see `LICENSE`).
 
 **What changed from the ncat v1**
 
-Version 1 was a bash script (now `legacy/termichat.sh`) that ran
-`ncat -l --broker` as the "server" and piped each line through
-`ncat host port` on the client. `ncat` simply copied raw bytes between all
-connected clients. The script prefixed messages with `[HH:MM] [USER]:` *on the
-client*, so the server had no idea who anyone was, could not validate anything,
-and any client could claim any name. Version 2 replaces that with our own C++
-server and client:
+The earlier version used a bash-based `ncat` setup: `ncat -l --broker` acted
+as the server, while each client piped lines through `ncat host port`. `ncat`
+simply copied raw bytes between all connected clients. Messages were prefixed
+with `[HH:MM] [USER]:` *on the client*, so the server had no idea who anyone
+was, could not validate anything, and any client could claim any name. That
+implementation is preserved in the `legacy-bash` branch. The current version
+replaces that approach with our own C++ server and client:
 
-| | v1 (`termichat.sh`) | v2 (this repo) |
+| | v1 (`legacy-bash` branch) | v2 (this repo) |
 |---|---|---|
 | Server | `ncat --broker` (external tool) | `termichat_server`, our own accept loop and threads |
 | Message boundaries | none (raw bytes) | 4-byte length prefix |
@@ -59,7 +61,7 @@ server and client:
 
 - Linux, a C++17 compiler (g++), `make`, POSIX threads. No other libraries.
 - A UTF-8 locale is optional: without it the client uses ASCII symbols.
-- For [packet analysis](docs/WIRESHARK.md): `tcpdump`, Wireshark, `iproute2` (`ss`).
+- Optional tools for packet inspection: `tcpdump`, Wireshark, and `iproute2` (`ss`).
 
 ```sh
 # Debian / Ubuntu
@@ -169,8 +171,6 @@ terminal. The line `Listening on 0.0.0.0:PORT` is always logged.
 | `src/render.hpp`, `src/render.cpp` | Pure functions turning events into terminal lines (wrapping, banner, help, input row). |
 | `Makefile` | `all`, `test`, `clean`. |
 | `tests/` | Unit tests and `smoke_test.sh`, as referenced by the Makefile. |
-| `legacy/termichat.sh` | The v1 `ncat` script, kept for reference. Not built or used. |
-| `docs/PROTOCOL.md`, `docs/WIRESHARK.md`, `docs/VIVA.md` | Protocol reference, packet-analysis guide, viva preparation. |
 
 ## Networking explained
 
@@ -314,8 +314,10 @@ counts the type byte plus the payload. Payload at most 2048 bytes.
 | 10 | `PRIV_SAY` | C to S | `<target>\|<text>` |
 | 11 | `PRIV_MSG` | S to C | `<unix_ts>\|<from>\|<to>\|<text>` |
 
-Full details, limits, validation rules, state diagram and example frames are in
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+The protocol implementation is in `src/protocol.hpp` and `src/protocol.cpp`.
+Use these files when inspecting or extending message types and payload encoding.
+Keep the client and server handling consistent when changing the protocol, then
+run `make test` to exercise the framing and protocol tests.
 
 ## Concurrency design
 
@@ -418,11 +420,17 @@ make clean
 
 ## Packet analysis with Wireshark
 
-Wireshark is an external tool, not part of TermiChat. See
-[`docs/WIRESHARK.md`](docs/WIRESHARK.md) for capture instructions and guided
-exercises (handshake, framing, broadcast fan-out, stream vs message boundaries,
-graceful and abrupt close, `TIME_WAIT`). For exam preparation see
-[`docs/VIVA.md`](docs/VIVA.md).
+Wireshark is an external tool, not part of TermiChat. To inspect TermiChat traffic,
+start the server and connect one or more clients, then capture on the loopback
+interface (for local clients) or the network interface used by remote clients.
+Use the display filter `tcp.port == 12345` (replace the port if you use a
+different one), send public and private messages, request `/users`, and then
+disconnect. Inspect the TCP payload or use **Follow TCP Stream** to view the
+ordered byte stream. Since TCP does not preserve application message boundaries,
+a packet may contain part of a TermiChat frame or several frames; use the
+4-byte length prefix and 1-byte message type described above to interpret it.
+Wireshark displays this as a custom protocol carried over TCP, rather than
+automatically decoding TermiChat's message names.
 
 ## Limitations and future work
 
