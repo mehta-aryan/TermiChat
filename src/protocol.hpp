@@ -64,8 +64,9 @@ enum class FrameStatus {
 // send_frame: assembles header + type + payload into one buffer and writes it
 // with a single send_all() call, so the frame can never be interleaved with
 // another frame at the byte level.  Refuses payloads larger than MAX_PAYLOAD
-// (returns PROTOCOL_VIOLATION without writing anything).
-FrameStatus send_frame(int fd, MsgType type, const std::string& payload);
+// (returns PROTOCOL_VIOLATION without writing anything).  'send_flags' are
+// passed on to send() (see send_all), e.g. MSG_DONTWAIT for a best-effort frame.
+FrameStatus send_frame(int fd, MsgType type, const std::string& payload, int send_flags = 0);
 
 // recv_frame: reads the 4-byte header, validates the length before allocating,
 // then reads the body.  Distinguishes clean close from mid-frame truncation.

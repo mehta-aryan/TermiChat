@@ -11,6 +11,8 @@
 #include <poll.h>         // poll
 
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>         // fprintf
 #include <cstring>        // strerror
 #include <exception>
@@ -38,15 +40,16 @@ public:
     // Fixed after construction, so safe to read from any thread.
     bool interactive() const { return !style_.plain; }
 
-    // Enters the UI (interactive mode only): signal handlers, raw mode, banner,
-    // prompt.  stop() undoes it; both are safe to call twice.
+    // Enters the UI: signal handlers (both modes, so Ctrl+C and SIGTERM are
+    // always a graceful quit), then, in interactive mode only, raw mode, banner
+    // and prompt.  stop() undoes it; both are safe to call twice.
     void start(const std::string& me, const std::string& host, uint16_t port) {
         std::lock_guard<std::mutex> lk(mu_);
         me_ = me;
         host_ = host;
         port_ = port;
-        if (style_.plain) return;
         signals_.emplace();
+        if (style_.plain) return;
         raw_.emplace(STDIN_FILENO);
         style_.width = terminal_size(STDOUT_FILENO).cols;
         active_ = true;
@@ -55,11 +58,12 @@ public:
 
     void stop() {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!active_) return;
-        active_ = false;
-        write_all(STDOUT_FILENO, ERASE_ROW);   // leave a clean row for what comes next
-        raw_.reset();                          // terminal back to normal...
-        signals_.reset();                      // ...and the default signal behaviour
+        if (active_) {
+            active_ = false;
+            write_all(STDOUT_FILENO, ERASE_ROW);   // leave a clean row for what comes next
+            raw_.reset();                          // terminal back to normal...
+        }
+        signals_.reset();                          // ...and the default signal behaviour
     }
 
     void show(const ChatEvent& ev) {
@@ -296,33 +300,52 @@ void Client::receiver_loop() {
     // An exception must not escape a thread (that would be std::terminate with
     // the terminal still in raw mode), so it ends the session like any failure.
     try {
-        while (running_.load()) {
-            MsgType     type;
-            std::string payload;
-            FrameStatus st = recv_frame(sock_.fd(), type, payload);
-            const int   err = errno;   // only meaningful for IO_ERROR
-
-            if (st == FrameStatus::OK) {
-                ChatEvent ev;
-                if (make_event(type, payload, ev)) {
-                    sanitize_event(ev);                       // the server is not trusted
-                    if (ev.kind == EventKind::UserList) ev.timestamp = unix_now();
-                    screen_->show(ev);
-                    continue;
-                }
-                // A frame a client must never receive, or a malformed payload.
-                st = FrameStatus::PROTOCOL_VIOLATION;
-            }
-
-            // Any failure ends the session.  fail() tells us who got there
-            // first: if the main thread was already quitting on purpose
-            // (/quit, Ctrl+D) its shutdown() is what woke us up, so there is
-            // nothing to report and the exit code stays 0.
-            fail(describe_failure(st, err));
-            return;
-        }
+        receive_events();
     } catch (const std::exception& e) {
         fail(std::string("Internal error: ") + e.what());
+    }
+
+    // Tell disconnect() that the connection has been read to its end.
+    {
+        std::lock_guard<std::mutex> lk(done_mu_);
+        receiver_done_ = true;
+    }
+    done_cv_.notify_all();
+}
+
+// Reads until the connection ends.  It deliberately does NOT stop when the
+// user quits: after our QUIT it keeps reading (and showing what still arrives,
+// such as the echo of our last message) until the server closes, see
+// disconnect().  Only a failure, or the shutdown() calls in disconnect(), end it.
+void Client::receive_events() {
+    while (true) {
+        MsgType     type;
+        std::string payload;
+        FrameStatus st = recv_frame(sock_.fd(), type, payload);
+        const int   err = errno;   // only meaningful for IO_ERROR
+
+        if (st == FrameStatus::OK) {
+            ChatEvent ev;
+            if (make_event(type, payload, ev)) {
+                sanitize_event(ev);                       // the server is not trusted
+                if (ev.kind == EventKind::UserList) ev.timestamp = unix_now();
+                screen_->show(ev);
+                // From now on the end of the connection is the server's
+                // announced shutdown, not a failure (see fail()).
+                if (ev.kind == EventKind::System && ev.system_kind == SystemKind::Shutdown)
+                    server_notified_.store(true);
+                continue;
+            }
+            // A frame a client must never receive, or a malformed payload.
+            st = FrameStatus::PROTOCOL_VIOLATION;
+        }
+
+        // Any failure ends the session.  fail() tells us who got there
+        // first: if the main thread was already quitting on purpose
+        // (/quit, Ctrl+D) the connection ending is just the server answering
+        // our QUIT, so there is nothing to report and the exit code stays 0.
+        fail("Connection lost (" + describe_failure(st, err) + ")");
+        return;
     }
 }
 
@@ -330,9 +353,16 @@ void Client::receiver_loop() {
 void Client::fail(const std::string& message) {
     // The first to flip running_ owns the story: it sets the exit code and the
     // reason.  run() prints the reason once the terminal is back to normal.
+    //
+    // A server that announced its shutdown (SYSTEM kind=shutdown) and then
+    // closed the connection did nothing wrong: whoever notices the end first,
+    // the outcome is "Server shut down" with exit code 0.  Without that
+    // notice, the same end is a lost connection: exit code 1.
+    const bool announced = server_notified_.load();
     if (running_.exchange(false)) {
-        exit_code_.store(1);
-        end_message_ = message;
+        exit_code_.store(announced ? 0 : 1);
+        end_kind_    = announced ? SystemKind::Shutdown : SystemKind::Error;
+        end_message_ = announced ? "Server shut down" : message;
     }
 }
 
@@ -490,10 +520,13 @@ bool Client::handle_keys(const std::vector<Key>& keys) {
 }
 
 // Ctrl+C, SIGTERM and SIGHUP only set a flag (see SignalGuard); here the main
-// loop turns it into an ordinary user quit.  Also picks up window resizes.
+// loop turns it into an ordinary user quit, in plain mode too.  The handlers
+// have no SA_RESTART, so a blocked poll() returns at once; and if the signal
+// lands just before poll(), the 200 ms timeout bounds the delay.  In
+// interactive mode this also picks up window resizes.
 bool Client::service_terminal() {
     if (SignalGuard::stop_requested()) return false;
-    screen_->refresh();
+    if (screen_->interactive()) screen_->refresh();
     return true;
 }
 
@@ -503,7 +536,7 @@ void Client::input_loop() {
     char buf[256];
 
     while (running_.load()) {
-        if (ui && !service_terminal()) return;
+        if (!service_terminal()) return;
 
         ssize_t n = 0;
         std::string error;
@@ -531,16 +564,34 @@ void Client::input_loop() {
     }
 }
 
+// How long a quitting client waits for the server to close its side.
+static constexpr std::chrono::seconds QUIT_DRAIN_TIMEOUT{2};
+
 void Client::disconnect() {
     // Claim the "who ended the session" decision.  If exchange() returns true
-    // the user quit (/quit, Ctrl+D, Ctrl+C): say goodbye properly so the server
-    // can tell this apart from a crash.  If false, the receiver (or fail())
-    // already recorded a problem and set the exit code.
-    if (running_.exchange(false))
+    // the user quit (/quit, Ctrl+D, Ctrl+C, SIGTERM): say goodbye properly so
+    // the server can tell this apart from a crash.  If false, the receiver (or
+    // fail()) already recorded the outcome and set the exit code.
+    if (running_.exchange(false)) {
         send_frame(sock_.fd(), MsgType::QUIT, "");
 
-    // shutdown() sends a TCP FIN to the server and unblocks the receiver
-    // thread's recv() call, which then sees running_ == false and exits quietly.
+        // Half-close: SHUT_WR sends OUR FIN after the QUIT, but the socket stays
+        // readable.  Then keep reading until the server closes its side (the
+        // receiver thread does the reading and flags it when it hits EOF) or
+        // QUIT_DRAIN_TIMEOUT has passed.  Why not simply close()?  Closing a
+        // socket that still has unread data in its receive queue makes the
+        // kernel send a RST instead of a FIN.  A RST aborts the connection, so
+        // the server may lose our final frames (the QUIT itself) and see a
+        // "connection reset" instead of a clean leave.  Reading everything
+        // first means the socket closes with an empty queue and a normal FIN.
+        ::shutdown(sock_.fd(), SHUT_WR);
+        std::unique_lock<std::mutex> lk(done_mu_);
+        done_cv_.wait_for(lk, QUIT_DRAIN_TIMEOUT, [this] { return receiver_done_; });
+    }
+
+    // Wakes the receiver if it is still blocked in recv(): the drain timed out,
+    // or the session failed on our side (a send error) while the receiver was
+    // still waiting.  Harmless on a connection that is already finished.
     ::shutdown(sock_.fd(), SHUT_RDWR);
 
     if (recv_thread_.joinable()) recv_thread_.join();
@@ -557,7 +608,8 @@ int Client::run() {
         disconnect();
     }   // terminal restored here, on every way out
 
-    // Only now, in normal terminal mode, say why the session failed.
-    if (!end_message_.empty()) notice(SystemKind::Error, end_message_);
+    // Only now, in normal terminal mode, say how the session ended: "Server
+    // shut down" (exit 0) or why it failed (exit 1).  A user quit says nothing.
+    if (!end_message_.empty()) notice(end_kind_, end_message_);
     return exit_code_.load();
 }

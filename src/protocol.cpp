@@ -12,7 +12,7 @@ bool is_known_type(uint8_t raw) {
            raw <= static_cast<uint8_t>(MsgType::PRIV_MSG);
 }
 
-FrameStatus send_frame(int fd, MsgType type, const std::string& payload) {
+FrameStatus send_frame(int fd, MsgType type, const std::string& payload, int send_flags) {
     // Never emit a frame that every receiver would reject as a protocol
     // violation (recv_frame enforces the same limit).
     if (payload.size() > MAX_PAYLOAD) return FrameStatus::PROTOCOL_VIOLATION;
@@ -32,7 +32,7 @@ FrameStatus send_frame(int fd, MsgType type, const std::string& payload) {
     if (!payload.empty())
         std::memcpy(frame.data() + 5, payload.data(), payload.size());
 
-    return send_all(fd, frame.data(), frame.size()) == IOStatus::OK
+    return send_all(fd, frame.data(), frame.size(), send_flags) == IOStatus::OK
                ? FrameStatus::OK
                : FrameStatus::IO_ERROR;
 }

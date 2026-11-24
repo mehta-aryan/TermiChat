@@ -5,13 +5,13 @@
 #include <sys/socket.h>
 #include <cerrno>
 
-IOStatus send_all(int fd, const void* buf, std::size_t len) {
+IOStatus send_all(int fd, const void* buf, std::size_t len, int flags) {
     const auto* ptr = static_cast<const char*>(buf);
     std::size_t sent = 0;
 
     while (sent < len) {
         // MSG_NOSIGNAL: suppress SIGPIPE; we get EPIPE as an errno instead.
-        ssize_t n = ::send(fd, ptr + sent, len - sent, MSG_NOSIGNAL);
+        ssize_t n = ::send(fd, ptr + sent, len - sent, MSG_NOSIGNAL | flags);
         if (n < 0) {
             if (errno == EINTR) continue;   // interrupted by signal – retry
             return IOStatus::ERROR;

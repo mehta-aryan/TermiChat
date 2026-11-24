@@ -75,7 +75,10 @@ enum class IOStatus { OK, PEER_CLOSED, ERROR };
 // MSG_NOSIGNAL: if the peer has closed the connection, send() raises SIGPIPE
 // by default, which terminates the process.  MSG_NOSIGNAL turns that into a
 // return of -1 / EPIPE so we can handle it gracefully.
-IOStatus send_all(int fd, const void* buf, std::size_t len);
+//
+// 'flags' are ORed into MSG_NOSIGNAL.  MSG_DONTWAIT makes a full kernel send
+// buffer fail at once with EAGAIN instead of blocking (best-effort notices).
+IOStatus send_all(int fd, const void* buf, std::size_t len, int flags = 0);
 
 // ── recv_all ─────────────────────────────────────────────────────────────────
 // TCP recv() may return fewer bytes than requested (partial read – the kernel
